@@ -1,0 +1,94 @@
+name: Build PDF
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install TeX Live
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          texlive-full \
+          texlive-xetex \
+          texlive-luatex \
+          texlive-lang-chinese \
+          fonts-noto-cjk \
+          fonts-wqy-microhei \
+          fonts-wqy-zenhei
+
+    - name: Set execute permission for build script
+      run: chmod +x build.sh
+
+    - name: Build PDF
+      run: ./build.sh
+
+    - name: Check PDF file
+      run: |
+        if [ -f "深入理解Linux_Folio.pdf" ]; then
+          echo "PDF generated successfully"
+          ls -lh 深入理解Linux_Folio.pdf
+        else
+          echo "Error: PDF file not found"
+          exit 1
+        fi
+
+    - name: Upload PDF as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: 深入理解Linux_Folio-${{ github.sha }}
+        path: 深入理解Linux_Folio.pdf
+        retention-days: 30
+
+    # 保存构建目录以便调试
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-${{ github.sha }}
+        path: build/*.log
+        retention-days: 7
+        if-no-files-found: ignore
+
+  # 自动发布 Release（仅在打 tag 时）
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Download PDF artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: 深入理解Linux_Folio-${{ github.sha }}
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: 深入理解Linux_Folio.pdf
+        body: |
+          ## 深入理解 Linux Folio - PDF 发布
+
+          自动构建的 PDF 文件，基于提交 ${{ github.sha }}
+
+          ### 下载
+          点击下方的 PDF 文件即可下载完整版本。
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
