@@ -1,0 +1,1058 @@
+\documentclass[../main.tex]{subfiles}
+\begin{document}
+% 第2章 struct page 的历史与困境
+\chapter{struct page 的历史与困境}
+\label{chap:page-history}
+
+\begin{epigraph}
+\textit{``struct page is the most abused data structure in the kernel.''}
+\begin{flushright}
+--- 匿名内核开发者
+\end{flushright}
+\end{epigraph}
+
+\section{引言}
+
+要真正理解 folio 的价值，我们必须深入了解 \texttt{struct page} 的历史演变和它所面临的困境。\texttt{struct page} 是 Linux 内核中最古老、最核心的数据结构之一，它的设计深刻影响着整个内存管理子系统。
+
+本章将从源码考古的角度，追溯 \texttt{struct page} 从 Linux 早期版本到现代内核的演变过程，分析其设计决策的历史背景，以及这些决策如何导致了今天的问题。
+
+\section{早期 Linux 的内存管理}
+
+\subsection{Linux 0.01 的内存模型}
+
+1991 年，当 Linus Torvalds 发布 Linux 0.01 时，内存管理还非常原始。让我们看看当时的实现：
+
+\begin{lstlisting}[caption={Linux 0.01 的内存管理（mm/memory.c）}]
+/*
+ * Linux 0.01 的内存管理
+ * 来源: linux-0.01/mm/memory.c
+ */
+
+#define LOW_MEM 0x100000           /* 1MB 以下是 BIOS 和内核 */
+#define PAGING_MEMORY (15*1024*1024)  /* 可分页内存大小 */
+#define PAGING_PAGES (PAGING_MEMORY>>12)  /* 可用页数 */
+#define MAP_NR(addr) (((addr)-LOW_MEM)>>12)  /* 地址到页号 */
+#define USED 100
+
+static unsigned char mem_map[PAGING_PAGES] = {0,};
+
+/*
+ * 获取一个空闲页
+ * 从高地址向低地址搜索
+ */
+unsigned long get_free_page(void)
+{
+    register unsigned long __res asm("ax");
+    __asm__("std ; repne ; scasb\n\t"
+            "jne 1f\n\t"
+            "movb $1,1(%%edi)\n\t"
+            "sall $12,%%ecx\n\t"
+            "addl %2,%%ecx\n\t"
+            "movl %%ecx,%%edx\n\t"
+            "movl $1024,%%ecx\n\t"
+            "leal 4092(%%edx),%%edi\n\t"
+            "rep ; stosl\n\t"
+            "movl %%edx,%%eax\n"
+            "1:"
+            :"=a" (__res)
+            :"0" (0),"i" (LOW_MEM),"c" (PAGING_PAGES),
+             "D" (mem_map+PAGING_PAGES-1)
+            );
+    return __res;
+}
+
+/*
+ * 释放一个页
+ */
+void free_page(unsigned long addr)
+{
+    if (addr < LOW_MEM) return;
+    if (addr >= HIGH_MEMORY)
+        panic("trying to free nonexistent page");
+    addr -= LOW_MEM;
+    addr >>= 12;
+    if (mem_map[addr]--) return;
+    mem_map[addr]=0;
+    panic("trying to free free page");
+}
+\end{lstlisting}
+
+这就是 Linux 内存管理的起点。没有 \texttt{struct page}，没有伙伴系统，连个像样的数据结构都没有。\texttt{mem\_map} 就是一个 \texttt{unsigned char} 数组，一个字节对应一个物理页框，字节值就是引用计数。整个可分页内存被硬编码为 15MB，1MB 以下留给 BIOS 和内核。
+
+\texttt{get\_free\_page()} 可能是你见过的最"硬核"的页分配器了：整个分配逻辑写成了一段内联汇编。\texttt{std; repne; scasb} 从数组末尾向前扫描，找到第一个值为 0 的条目。找到后左移 12 位还原成物理地址，再用 \texttt{rep; stosl} 把 4KB 清零。完全不可移植，但在 i386 上跑得飞快。
+
+\texttt{free\_page()} 简单得多，但有个小技巧值得留意：\texttt{if (mem\_map[addr]--) return} 利用了后缀递减的语义。如果计数非零，递减后直接返回；如果已经是 0，递减会下溢，接下来的代码把它重置为 0 并 panic。这是一种很紧凑的双重释放检测。
+
+关键观察：
+\begin{itemize}
+    \item 没有 \texttt{struct page}，只有一个简单的字节数组 \texttt{mem\_map}
+    \item 每个页的元数据只有一个字节（引用计数）
+    \item 完全针对 i386 架构，使用汇编优化
+    \item 没有考虑多处理器、高端内存等复杂情况
+\end{itemize}
+
+\subsection{struct page 的诞生}
+
+随着内核的发展，简单的字节数组已经无法满足需求。\texttt{struct page} 在 Linux 2.0 左右开始成形。让我们看看早期版本：
+
+\begin{lstlisting}[caption={Linux 2.0 的 struct page（简化）}]
+/*
+ * Linux 2.0 时期的 struct page
+ * 这是一个简化的重构版本
+ */
+struct page {
+    /* 页的状态标志 */
+    unsigned long flags;
+    
+    /* 引用计数 */
+    atomic_t count;
+    
+    /* 用于各种链表 */
+    struct page *next;
+    struct page *prev;
+    
+    /* 关联的 inode（用于页缓存） */
+    struct inode *inode;
+    
+    /* 文件中的偏移 */
+    unsigned long offset;
+    
+    /* 关联的缓冲区头 */
+    struct buffer_head *buffers;
+};
+\end{lstlisting}
+
+这个结构相对简单，但已经开始承担多重职责：
+\begin{itemize}
+    \item 作为物理页框的描述符
+    \item 作为页缓存的一部分
+    \item 作为缓冲区缓存的容器
+\end{itemize}
+
+\section{struct page 的演变}
+
+\subsection{2.4 内核：复杂性的开始}
+
+Linux 2.4 内核对内存管理做了重大改进，\texttt{struct page} 也随之变得更加复杂：
+
+\begin{lstlisting}[caption={Linux 2.4 的 struct page}]
+/*
+ * Linux 2.4.x 的 struct page
+ * include/linux/mm.h
+ */
+typedef struct page {
+    /* 链表指针，根据页的状态加入不同链表 */
+    struct list_head list;
+    
+    /* 用于页缓存的 mapping */
+    struct address_space *mapping;
+    
+    /* 文件内索引或交换空间标识 */
+    unsigned long index;
+    
+    /* 下一个哈希链表项 */
+    struct page *next_hash;
+    
+    /* 引用计数 */
+    atomic_t count;
+    
+    /* 页标志 */
+    unsigned long flags;
+    
+    /* 用于 LRU 链表 */
+    struct list_head lru;
+    
+    /* 关联的缓冲区 */
+    struct buffer_head *buffers;
+    
+    /* 虚拟地址（仅高端内存） */
+    void *virtual;
+    
+    /* 所属的内存区域 */
+    struct zone_struct *zone;
+} mem_map_t;
+\end{lstlisting}
+
+2.4 内核引入了几个重要概念：
+\begin{enumerate}
+    \item \textbf{address\_space}：抽象了文件与内存的映射关系
+    \item \textbf{内存区域（zones）}：ZONE\_DMA、ZONE\_NORMAL、ZONE\_HIGHMEM
+    \item \textbf{LRU 链表}：用于页面回收
+\end{enumerate}
+
+\subsection{2.6 内核：联合体的引入}
+
+Linux 2.6 内核是一个里程碑式的版本，它引入了联合体（union）来复用 \texttt{struct page} 的空间：
+
+\begin{lstlisting}[caption={Linux 2.6 早期的 struct page}]
+/*
+ * Linux 2.6.x 的 struct page
+ */
+struct page {
+    unsigned long flags;
+    atomic_t _count;
+    atomic_t _mapcount;
+    
+    union {
+        struct {
+            /* 页缓存使用 */
+            unsigned long private;
+            struct address_space *mapping;
+        };
+        struct {
+            /* slab 使用 */
+            struct kmem_cache *slab_cache;
+            void *freelist;
+        };
+    };
+    
+    pgoff_t index;
+    struct list_head lru;
+    
+    /*
+     * 在 64 位系统上，我们有更多空间
+     */
+#if defined(CONFIG_64BIT)
+    /* 额外字段 */
+#endif
+};
+\end{lstlisting}
+
+联合体的引入是一把双刃剑：
+\begin{itemize}
+    \item \textbf{优点}：节省内存，一个页的元数据不需要为所有可能的用途分配空间
+    \item \textbf{缺点}：代码可读性下降，容易出错，难以扩展
+\end{itemize}
+
+\subsection{复合页的引入}
+
+Linux 2.6.16 左右引入了复合页（compound pages）的概念，这是为了支持巨页（huge pages）而做的重要改变：
+
+\begin{lstlisting}[caption={复合页的实现}]
+/*
+ * 复合页的实现
+ * 
+ * 复合页由 2^order 个连续的基础页组成
+ * 第一个页是"头页"（head page），其余是"尾页"（tail pages）
+ */
+
+/* 创建复合页 */
+static void prep_compound_page(struct page *page, unsigned int order)
+{
+    int i;
+    int nr_pages = 1 << order;
+    
+    /* 设置头页 */
+    __SetPageHead(page);
+    page[1].compound_order = order;
+    page[1].compound_dtor = COMPOUND_PAGE_DTOR;
+    
+    /* 设置尾页 */
+    for (i = 1; i < nr_pages; i++) {
+        struct page *p = page + i;
+        
+        /*
+         * compound_head 字段存储头页地址
+         * 最低位设为 1 表示这是尾页
+         */
+        p->compound_head = (unsigned long)page + 1;
+    }
+    
+    atomic_set(&page->_compound_mapcount, -1);
+}
+
+/* 获取复合页的头页 */
+static inline struct page *compound_head(struct page *page)
+{
+    unsigned long head = READ_ONCE(page->compound_head);
+
+    if (unlikely(head & 1))
+        return (struct page *)(head - 1);
+    return page;
+}
+
+/* 获取复合页的阶数 */
+static inline unsigned int compound_order(struct page *page)
+{
+    if (!PageHead(page))
+        return 0;
+    return page[1].compound_order;
+}
+\end{lstlisting}
+
+先看 \texttt{prep\_compound\_page()}。它把连续的 $2^{order}$ 个页组装成一个复合页。头页标上 \texttt{PG\_head}，阶数和析构函数索引塞进 \texttt{page[1]}——为什么不放在头页自己身上？因为头页的联合体空间已经被别的字段占满了，只能借用第一个尾页来存。每个尾页的 \texttt{compound\_head} 字段存的是头页地址加 1，这个 ``+1'' 不是偏移一个 \texttt{struct page}，而是在指针值的最低位设了个 1。\texttt{struct page} 天然对齐，地址最低位一定是 0，所以拿这一位当标记完全安全。
+
+\texttt{compound\_head()} 大概是内核里调用频率最高的函数之一了。逻辑很简单：读出 \texttt{compound\_head} 字段，最低位是 1 就说明当前是尾页，去掉标记位就拿到了头页指针；否则自己就是头页。\texttt{unlikely()} 告诉编译器大多数情况下我们拿到的就是头页，让分支预测偏向快速路径。
+
+再看 \texttt{compound\_order()}，这里有个设计上让人不太舒服的地方：你必须先确认自己拿到的是头页，然后通过 \texttt{page[1]} 去第一个尾页里取阶数。元数据散落在不同的 \texttt{struct page} 里，后面维护起来处处是坑。
+
+复合页的引入带来了显著的复杂性增加：
+\begin{enumerate}
+    \item 每个处理页的函数都需要考虑它可能是复合页的一部分
+    \item 某些操作应该作用于整个复合页，某些应该作用于单个基础页
+    \item 尾页的某些字段被复用来存储指向头页的指针
+\end{enumerate}
+
+\subsection{透明大页（THP）的影响}
+
+Linux 2.6.38 引入了透明大页（Transparent Huge Pages）功能，它允许内核自动将连续的小页合并为大页：
+
+\begin{lstlisting}[caption={透明大页的处理}]
+/*
+ * 透明大页相关代码
+ * mm/huge_memory.c
+ */
+
+/* 尝试将页升级为大页 */
+static int collapse_huge_page(struct mm_struct *mm,
+                              unsigned long address,
+                              struct page **hpage)
+{
+    struct vm_area_struct *vma;
+    struct page *new_page;
+    pmd_t *pmd, _pmd;
+    int result = SCAN_FAIL;
+    
+    /* 分配一个大页 */
+    new_page = alloc_pages(gfp_mask, HPAGE_PMD_ORDER);
+    if (!new_page) {
+        result = SCAN_ALLOC_HUGE_PAGE_FAIL;
+        goto out;
+    }
+    
+    /*
+     * 这里需要：
+     * 1. 锁定所有小页
+     * 2. 复制数据到大页
+     * 3. 更新页表
+     * 4. 释放小页
+     */
+    
+    /* 将新页设置为复合页 */
+    prep_compound_page(new_page, HPAGE_PMD_ORDER);
+    prep_transhuge_page(new_page);
+    
+    /* ... 复杂的迁移逻辑 ... */
+    
+    return result;
+}
+
+/* 拆分透明大页 */
+int split_huge_page_to_list(struct page *page, struct list_head *list)
+{
+    struct page *head = compound_head(page);
+    struct deferred_split *ds_queue = get_deferred_split_queue(head);
+
+    /*
+     * 拆分大页需要：
+     * 1. 确保没有进程正在使用
+     * 2. 分解复合页结构
+     * 3. 更新所有相关的页表
+     * 4. 处理引用计数
+     */
+
+    /* ... 复杂的拆分逻辑 ... */
+}
+\end{lstlisting}
+
+\texttt{collapse\_huge\_page()} 做的事情概念上很简单：分配一个 order-9（512 页 = 2MB）的连续物理页，组装成复合页，再把原来那些零散小页的数据搬进来。但被省略号藏起来的迁移逻辑才是真正的噩梦：你得锁住所有原始小页、逐页拷贝数据、把涉及的所有进程页表从 PTE 映射改成 PMD 映射、最后释放小页。任何一步被中断或者失败，都要能干净地回滚。
+
+反过来拆分就更麻烦了。\texttt{split\_huge\_page\_to\_list()} 第一步是 \texttt{compound\_head(page)}，因为传进来的可能是 512 个子页中的任意一个。为什么要有个延迟拆分队列（\texttt{deferred\_split\_queue}）？因为拆分的开销太大了：把一个 PMD 映射拆成 512 个 PTE、给每个子页建立独立的引用计数和映射计数、重建 LRU 链表。内核能拖就拖，实在逼不得已才做。
+
+透明大页使问题进一步复杂化，因为一个``页''可能在运行时从小页变成大页，或者反过来。
+
+\section{struct page 的现代形态}
+
+\subsection{Linux 5.x 的 struct page}
+
+到了 Linux 5.x，\texttt{struct page} 已经演变成一个庞大而复杂的结构：
+
+\begin{lstlisting}[caption={Linux 5.x 的完整 struct page 定义}]
+/*
+ * Linux 5.x 的 struct page
+ * include/linux/mm_types.h
+ * 
+ * 这是一个简化版，实际定义更加复杂
+ */
+struct page {
+    /* 第一个字：flags，必须在最开始 */
+    unsigned long flags;
+    
+    /*
+     * 五个字的联合体
+     * 
+     * 每种页类型使用不同的字段解释
+     * 这是历史演变的结果，也是问题的根源
+     */
+    union {
+        struct {
+            /* 用于页缓存和匿名页的 LRU */
+            struct list_head lru;
+            /* 页缓存: address_space
+             * 匿名页: anon_vma 指针（最低位设置）
+             * 交换缓存: swap 区域 */
+            struct address_space *mapping;
+            /* 页缓存中的索引 */
+            pgoff_t index;
+            /* 由使用者定义的私有数据 */
+            unsigned long private;
+        };
+        
+        struct {
+            /* 用于 slab/slub/slob 分配器 */
+            union {
+                struct list_head slab_list;
+                struct {
+                    struct page *next;
+                    int pages;
+                    int pobjects;
+                };
+            };
+            struct kmem_cache *slab_cache;
+            void *freelist;
+            union {
+                void *s_mem;
+                unsigned long counters;
+                struct {
+                    unsigned inuse:16;
+                    unsigned objects:15;
+                    unsigned frozen:1;
+                };
+            };
+        };
+        
+        struct {
+            /* 复合页的尾页使用 */
+            unsigned long compound_head;
+        };
+        
+        struct {
+            /* 复合页的第二个尾页使用 */
+            unsigned long _compound_pad_1;
+            atomic_t compound_mapcount;
+            unsigned int compound_nr;
+            unsigned char compound_dtor;
+            unsigned char compound_order;
+        };
+        
+        struct {
+            /* ZONE_DEVICE 页使用 */
+            unsigned long _zd_pad_1;
+            struct dev_pagemap *pgmap;
+            void *zone_device_data;
+        };
+        
+        struct rcu_head rcu_head;
+        
+        /* 更多联合体成员... */
+    };
+    
+    union {
+        /*
+         * 映射计数
+         * -1 表示没有映射
+         * 0 表示有一个映射
+         * N 表示有 N+1 个映射
+         */
+        atomic_t _mapcount;
+        
+        /*
+         * 如果设置了 PG_buddy，则使用此字段
+         */
+        unsigned int page_type;
+    };
+    
+    /* 引用计数 */
+    atomic_t _refcount;
+    
+#ifdef CONFIG_MEMCG
+    /* 内存控制组数据 */
+    unsigned long memcg_data;
+#endif
+    
+    /*
+     * 在某些架构上，我们在页结构末尾存储 KASAN 影子内存
+     */
+#if defined(CONFIG_KASAN)
+    /* KASAN 标签 */
+#endif
+};
+\end{lstlisting}
+
+到这个阶段，\texttt{struct page} 已经膨胀成了一个"瑞士军刀"式的结构体。\texttt{flags} 必须放在开头，大量底层代码硬编码了这个偏移。真正的重灾区是后面那个五字联合体（64 位系统上 40 字节）：页缓存往里塞了 \texttt{lru}、\texttt{mapping}、\texttt{index}、\texttt{private}；slab 把同一片内存解读为 \texttt{slab\_list}、\texttt{slab\_cache}、\texttt{freelist} 和一组位域计数器；复合页尾页只用了一个 \texttt{compound\_head}；第二个尾页又存了 \texttt{compound\_order} 之类的元数据；\texttt{ZONE\_DEVICE} 页还有自己的一套。五六种完全不同的用途叠在同一片内存上，你读错了字段，编译器不会吭一声，运行时只会拿到一堆垃圾数据。
+
+下面那个小联合体把 \texttt{\_mapcount} 和 \texttt{page\_type} 复用了。普通页用前者追踪页表映射数，伙伴系统空闲页和页表页用后者做类型标识，反正两者不会同时有意义。开了 \texttt{CONFIG\_MEMCG} 的话还得再加 8 字节给 cgroup 记账用。
+
+\subsection{struct page 的大小问题}
+
+让我们分析 \texttt{struct page} 的实际大小：
+
+\begin{lstlisting}[caption={计算 struct page 的大小}]
+/*
+ * 在 64 位系统上，struct page 的典型大小
+ */
+
+/* 核心字段 */
+unsigned long flags;          /*  8 字节 */
+/* 联合体（5 个字） */          /* 40 字节 */
+atomic_t _mapcount;           /*  4 字节 */
+atomic_t _refcount;           /*  4 字节 */
+
+#ifdef CONFIG_MEMCG
+unsigned long memcg_data;     /*  8 字节 */
+#endif
+
+/* 总计: 约 64 字节（带 memcg） */
+
+/*
+ * 对于 4GB 内存的系统：
+ * - 页数 = 4GB / 4KB = 1,048,576 页
+ * - mem_map 大小 = 1,048,576 * 64 = 64 MB
+ * 
+ * 对于 256GB 内存的系统：
+ * - 页数 = 256GB / 4KB = 67,108,864 页
+ * - mem_map 大小 = 67,108,864 * 64 = 4 GB
+ * 
+ * 这是巨大的内存开销！
+ */
+\end{lstlisting}
+
+算一笔账就知道问题有多大了。64 位系统上一个 \texttt{struct page} 大约 64 字节。4GB 内存的机器需要 64MB 来存 \texttt{mem\_map}，还能接受；但 256GB 的服务器呢？4GB 纯粹用来描述物理内存本身，占总内存的 1.6\%。而且这些 \texttt{struct page} 不能换出到磁盘，页分配器随时要用它们，必须常驻物理内存。
+
+folio 在这方面有个间接好处：一组连续页合成 folio 后，只有头页需要存完整元数据，尾页的部分字段可以腾出来做别的事。
+
+\subsection{页标志（Page Flags）的复杂性}
+
+\texttt{struct page} 的 \texttt{flags} 字段包含大量标志位：
+
+\begin{lstlisting}[caption={页标志定义}]
+/*
+ * include/linux/page-flags.h
+ * 
+ * 页标志占用 unsigned long 的各个位
+ */
+enum pageflags {
+    PG_locked,      /* 0: 页被锁定，正在进行 I/O */
+    PG_referenced,  /* 1: 页最近被访问 */
+    PG_uptodate,    /* 2: 页内容有效 */
+    PG_dirty,       /* 3: 页被修改，需要写回 */
+    PG_lru,         /* 4: 页在 LRU 链表上 */
+    PG_active,      /* 5: 页在活跃 LRU 链表 */
+    PG_workingset,  /* 6: 页在工作集中 */
+    PG_waiters,     /* 7: 有进程在等待页解锁 */
+    PG_error,       /* 8: I/O 错误 */
+    PG_slab,        /* 9: slab 分配器使用 */
+    PG_owner_priv_1,/* 10: 由所有者使用 */
+    PG_arch_1,      /* 11: 架构特定 */
+    PG_reserved,    /* 12: 保留页，不可换出 */
+    PG_private,     /* 13: 有私有数据 */
+    PG_private_2,   /* 14: 有更多私有数据 */
+    PG_writeback,   /* 15: 正在写回 */
+    PG_head,        /* 16: 复合页的头页 */
+    PG_mappedtodisk,/* 17: 有磁盘块映射 */
+    PG_reclaim,     /* 18: 即将被回收 */
+    PG_swapbacked,  /* 19: 由交换空间支持 */
+    PG_unevictable, /* 20: 不可驱逐 */
+#ifdef CONFIG_MMU
+    PG_mlocked,     /* 21: mlock() 锁定 */
+#endif
+#ifdef CONFIG_ARCH_USES_PG_UNCACHED
+    PG_uncached,    /* 22: 未缓存 */
+#endif
+#ifdef CONFIG_MEMORY_FAILURE
+    PG_hwpoison,    /* 23: 硬件内存错误 */
+#endif
+#if defined(CONFIG_PAGE_IDLE_FLAG)
+    PG_young,       /* 24: 年轻页 */
+    PG_idle,        /* 25: 空闲页 */
+#endif
+    /* ... 更多标志 ... */
+    
+    __NR_PAGEFLAGS,
+
+    /* 复合页尾页的标志 */
+    PG_head = PG_head,
+
+    /* 不在 flags 中，但通过 page_type 判断 */
+    PG_buddy,       /* 伙伴系统空闲页 */
+    PG_offline,     /* 离线页 */
+    PG_table,       /* 页表页 */
+    PG_guard,       /* 守卫页 */
+};
+\end{lstlisting}
+
+光看这个枚举，就能感受到 \texttt{struct page} 被迫承担了多少不相干的职责。25 个以上的标志位，涵盖 I/O 状态、LRU 管理、页缓存属性、内存类型标识，还有一堆受 \texttt{CONFIG\_xxx} 条件编译控制的可选标志。同一个标志位编号在不同内核配置下可能代表不同的东西。
+
+还有一个容易踩坑的地方：\texttt{\_\_NR\_PAGEFLAGS} 后面那些 \texttt{PG\_buddy}、\texttt{PG\_table} 之类的，虽然写在同一个枚举里，其实根本不存在 \texttt{flags} 字段中。它们是通过 \texttt{page\_type} 这个联合体成员来编码的。另外，复合页只有头页有 \texttt{PG\_head}，尾页并没有对称的 \texttt{PG\_tail}，判断尾页得靠 \texttt{compound\_head} 字段的最低位。这种不对称性在写代码时很容易忘掉。
+
+每个标志都有对应的操作函数：
+
+\begin{lstlisting}[caption={页标志操作函数}]
+/*
+ * 对于每个标志 PG_xxx，都定义了以下函数：
+ * - PageXxx(page): 测试标志是否设置
+ * - SetPageXxx(page): 设置标志
+ * - ClearPageXxx(page): 清除标志
+ * - __SetPageXxx(page): 非原子设置
+ * - __ClearPageXxx(page): 非原子清除
+ * - TestSetPageXxx(page): 原子测试并设置
+ * - TestClearPageXxx(page): 原子测试并清除
+ */
+
+/* 示例：PG_locked 的操作函数 */
+static __always_inline int PageLocked(struct page *page)
+{
+    return test_bit(PG_locked, &page->flags);
+}
+
+static __always_inline void SetPageLocked(struct page *page)
+{
+    set_bit(PG_locked, &page->flags);
+}
+
+static __always_inline void ClearPageLocked(struct page *page)
+{
+    clear_bit(PG_locked, &page->flags);
+}
+
+static __always_inline int TestSetPageLocked(struct page *page)
+{
+    return test_and_set_bit(PG_locked, &page->flags);
+}
+
+/*
+ * 问题：这些函数对复合页的行为是什么？
+ * - PageLocked(tail_page) 会返回什么？
+ * - SetPageLocked(tail_page) 会设置谁的标志？
+ * 
+ * 答案取决于标志的具体定义，非常容易出错！
+ */
+\end{lstlisting}
+
+每个 \texttt{PG\_xxx} 标志都通过宏批量生成一族操作函数。带不带双下划线前缀的区别在于是否原子操作：\texttt{SetPageXxx()} 是原子的，多处理器安全；\texttt{\_\_SetPageXxx()} 不是，只在确定没有竞争时才能用，比如页刚分配出来的初始化阶段。\texttt{TestSetPageXxx()} 这种原子测试并设置的变体，常用来实现锁。
+
+但这里藏着一个大坑。注意代码末尾的注释：这些函数直接操作你传入的那个 \texttt{page->flags}，\textbf{不会}帮你调 \texttt{compound\_head()}。所以如果你拿一个尾页去调 \texttt{PageLocked()}，查到的是尾页自己的 \texttt{PG\_locked} 位，而锁实际上设在头页上。结果？永远返回 false。这类 bug 排查起来极其痛苦，因为代码逻辑看上去完全没问题。
+
+\section{具体问题案例分析}
+
+\subsection{案例一：page\_address() 的困境}
+
+\texttt{page\_address()} 函数用于获取页的虚拟地址，但它的行为在不同情况下有所不同：
+
+\begin{lstlisting}[caption={page\_address() 的问题}]
+/*
+ * page_address() 的实现分析
+ */
+
+/* 在没有高端内存的系统上（大多数 64 位系统） */
+static inline void *page_address(const struct page *page)
+{
+    return (void *)((unsigned long)page_to_pfn(page) << PAGE_SHIFT);
+}
+
+/*
+ * 问题场景：
+ */
+void problematic_function(struct page *page)
+{
+    void *addr;
+    
+    /* 
+     * 如果 page 是复合页的尾页会怎样？
+     * page_address() 返回的是这个尾页的地址
+     * 但调用者可能期望整个复合页的起始地址
+     */
+    addr = page_address(page);
+    
+    /* 
+     * 现在 addr 指向复合页中间的某处
+     * 如果我们尝试访问"整个页"的数据，会出问题
+     */
+    memset(addr, 0, PAGE_SIZE);  /* 这可能是错的！ */
+}
+
+/* 更安全的做法 */
+void safer_function(struct page *page)
+{
+    struct page *head = compound_head(page);
+    void *addr = page_address(head);
+    size_t size = page_size(head);  /* 获取复合页的完整大小 */
+    
+    memset(addr, 0, size);
+}
+\end{lstlisting}
+
+\texttt{page\_address()} 不管你传的是不是尾页，它就老老实实返回那个页的地址。如果你传了一个复合页的第 3 个尾页进去，拿到的就是那个尾页对应的 4KB 区域的起始地址，跟复合页的起始地址差了 12KB。接下来 \texttt{memset(addr, 0, PAGE\_SIZE)} 只清零了 4KB，如果你本意是清整个复合页，剩下的数据纹丝不动。
+
+正确的写法在 \texttt{safer\_function()} 里：先 \texttt{compound\_head()} 拿到头页，再取地址，用 \texttt{page\_size()} 拿到真实大小。问题是谁来保证所有调用者都记得这么做？没有人。编译器帮不了你，只能靠开发者自觉和代码审查。
+
+\subsection{案例二：页锁的语义}
+
+页锁（page lock）的行为对于复合页来说特别混乱：
+
+\begin{lstlisting}[caption={页锁的问题}]
+/*
+ * 页锁操作分析
+ */
+
+/* lock_page() 的实现 */
+static inline void lock_page(struct page *page)
+{
+    /* 注意：这里会自动找到头页 */
+    page = compound_head(page);
+    
+    might_sleep();
+    if (!trylock_page(page))
+        __lock_page(page);
+}
+
+/* trylock_page() 的实现 */
+static inline int trylock_page(struct page *page)
+{
+    /* 也是操作头页 */
+    page = compound_head(page);
+    return (likely(!test_and_set_bit_lock(PG_locked, &page->flags)));
+}
+
+/*
+ * 问题：以下代码正确吗？
+ */
+void questionable_code(struct page *page)
+{
+    /* 传入了一个尾页 */
+    lock_page(page);
+    
+    /* 现在我们锁定了整个复合页 */
+    
+    /* 但是，我们使用的是尾页的指针 */
+    /* 某些操作可能仍然对尾页做错误的假设 */
+    
+    /* 比如这个检查 */
+    if (PageLocked(page)) {  /* 这会检查头页还是尾页？ */
+        /* ... */
+    }
+    
+    unlock_page(page);  /* 这会解锁头页还是尾页？ */
+}
+
+/*
+ * PageLocked() 的实际实现
+ */
+static inline int PageLocked(struct page *page)
+{
+    /* 注意：这里 *没有* 自动调用 compound_head() */
+    return test_bit(PG_locked, &page->flags);
+}
+
+/*
+ * 所以 PageLocked(tail_page) 总是返回 false！
+ * 因为锁是在头页上设置的！
+ * 
+ * 这是一个极其容易出错的 API 设计
+ */
+\end{lstlisting}
+
+这是整个 \texttt{struct page} API 里最阴险的不一致。\texttt{lock\_page()} 内部会调 \texttt{compound\_head()}，传尾页进去也能正确锁住头页。\texttt{unlock\_page()} 同理。但 \texttt{PageLocked()} 不会。它直接查传入页的 \texttt{PG\_locked} 位。
+
+所以 \texttt{questionable\_code()} 里发生了什么？\texttt{lock\_page(page)} 锁住了头页，没问题。然后 \texttt{PageLocked(page)} 去查尾页的标志位，尾页上当然没设过 \texttt{PG\_locked}，永远返回 false。你以为锁了，检查却告诉你没锁。\texttt{unlock\_page()} 倒是能正确解锁，因为它也会自动找头页。
+
+哪些函数自动处理复合页，哪些不处理？没有规律可循，你只能逐个翻源码确认。这就是 folio 要用类型系统解决的核心痛点。
+
+\subsection{案例三：引用计数的混乱}
+
+复合页的引用计数处理更加复杂：
+
+\begin{lstlisting}[caption={引用计数的问题}]
+/*
+ * 复合页的引用计数分析
+ */
+
+/* get_page() 的实现 */
+static inline void get_page(struct page *page)
+{
+    page = compound_head(page);
+    
+    /* 增加头页的引用计数 */
+    VM_BUG_ON_PAGE(page_ref_zero_or_close_to_overflow(page), page);
+    page_ref_inc(page);
+}
+
+/* put_page() 的实现 */
+void put_page(struct page *page)
+{
+    page = compound_head(page);
+    
+    if (put_page_testzero(page))
+        __put_page(page);
+}
+
+/*
+ * 但是，某些代码需要对单个子页进行引用计数
+ * 比如 GUP（Get User Pages）的 FOLL_GET 行为
+ */
+
+/*
+ * 这导致了两套引用计数系统：
+ * 1. page->_refcount: 整个复合页的引用计数
+ * 2. 每个子页的 mapcount: 映射到页表的计数
+ * 
+ * 两者的语义不同，容易混淆
+ */
+
+/* 检查页是否被引用 */
+int page_count(struct page *page)
+{
+    return atomic_read(&compound_head(page)->_refcount);
+}
+
+/* 检查页是否被映射 */
+int page_mapped(struct page *page)
+{
+    int mapcount;
+    
+    page = compound_head(page);
+    
+    /* 复合页有两个 mapcount */
+    if (PageCompound(page)) {
+        /* compound_mapcount: 整个复合页的映射 */
+        mapcount = atomic_read(&page->_compound_mapcount) + 1;
+        /* 加上各个子页的映射 */
+        mapcount += atomic_read(&page->_mapcount) + 1;
+    } else {
+        mapcount = atomic_read(&page->_mapcount) + 1;
+    }
+    
+    return mapcount > 0;
+}
+\end{lstlisting}
+
+\texttt{get\_page()} 和 \texttt{put\_page()} 还好理解，都是先 \texttt{compound\_head()} 找到头页，再操作头页的 \texttt{\_refcount}。引用归零时 \texttt{\_\_put\_page()} 负责释放整个复合页。
+
+麻烦的是 \texttt{page\_mapped()}。复合页其实有两套映射计数：\texttt{\_compound\_mapcount} 记录整个复合页被当作大页映射了几次（比如 PMD 映射 2MB），每个子页的 \texttt{\_mapcount} 记录该子页被独立映射了几次（比如 fork 之后 COW）。两者得加起来才是对的。拆分大页时还得把这两套计数器拆开重分配——搞错了不是页面泄漏就是 use-after-free。
+
+\subsection{案例四：slab 与页缓存的冲突}
+
+\texttt{struct page} 试图同时服务于 slab 分配器和页缓存，这导致了字段复用的问题：
+
+\begin{lstlisting}[caption={slab 与页缓存的字段冲突}]
+/*
+ * struct page 的联合体问题
+ */
+struct page {
+    union {
+        struct {
+            /* 页缓存使用 */
+            struct list_head lru;
+            struct address_space *mapping;
+            pgoff_t index;
+            unsigned long private;
+        };
+        struct {
+            /* slab 使用 */
+            struct list_head slab_list;
+            struct kmem_cache *slab_cache;
+            void *freelist;
+            unsigned int inuse;
+        };
+    };
+};
+
+/*
+ * 问题：如何判断一个页是 slab 页还是页缓存页？
+ */
+static inline bool page_is_slab(struct page *page)
+{
+    return PageSlab(page);  /* 检查 PG_slab 标志 */
+}
+
+/*
+ * 但是在某些代码路径中，我们可能还没有设置 PG_slab
+ * 或者刚刚清除了它，这时候字段的解释就变得不确定
+ */
+
+/*
+ * 更糟糕的是，某些调试功能（如 KASAN）需要在两种情况下
+ * 都能正确工作，这增加了复杂性
+ */
+
+/* 
+ * KASAN 需要知道内存的类型来进行正确的检查
+ * 但 struct page 的类型是动态变化的
+ */
+void kasan_check_page(struct page *page)
+{
+    if (PageSlab(page)) {
+        /* 作为 slab 页处理 */
+        kasan_check_slab(page);
+    } else if (page->mapping) {
+        /* 作为页缓存页处理 */
+        kasan_check_pagecache(page);
+    } else {
+        /* ??? 不确定的状态 */
+    }
+}
+\end{lstlisting}
+
+页缓存用 \texttt{lru}、\texttt{mapping}、\texttt{index}、\texttt{private}，slab 把同一片内存解读成 \texttt{slab\_list}、\texttt{slab\_cache}、\texttt{freelist}、\texttt{inuse}。两组字段叠在一起，靠 \texttt{PG\_slab} 标志位来区分。
+
+看 \texttt{kasan\_check\_page()} 就知道这有多别扭：KASAN 要根据页类型选检查策略，但页从 slab 释放回伙伴系统的过程中，\texttt{PG\_slab} 可能已经清了，\texttt{mapping} 还没初始化。这时候你查哪个字段都不靠谱。这种"半生不熟"的中间状态也是后来 \texttt{struct slab} 被独立出去的原因之一。
+
+\section{社区的讨论与争议}
+
+\subsection{早期的改进尝试}
+
+在 folio 之前，社区曾尝试过其他方式来解决 \texttt{struct page} 的问题：
+
+\begin{enumerate}
+    \item \textbf{compound\_page() 自动处理}
+    
+    一些函数开始在内部自动调用 \texttt{compound\_head()}，但这不是一致的行为。
+    
+    \item \textbf{thp\_xxx() 函数族}
+    
+    为透明大页创建专门的函数，如 \texttt{thp\_lock()}、\texttt{thp\_unlock()}。但这只是部分解决问题。
+    
+    \item \textbf{文档和注释}
+    
+    试图通过更好的文档来解释函数的预期行为。但在实践中，开发者很少仔细阅读这些文档。
+\end{enumerate}
+
+\subsection{folio 提案的初始反应}
+
+2020-2021 年，当 Matthew Wilcox 首次提出 folio 时，社区的反应是混合的：
+
+\textbf{支持的观点：}
+\begin{itemize}
+    \item 提供了急需的类型安全
+    \item 简化了复合页的处理
+    \item 为未来的改进奠定基础
+    \item 使代码意图更加清晰
+\end{itemize}
+
+\textbf{反对/担忧的观点：}
+\begin{itemize}
+    \item 大规模的 API 变更会引入 bug
+    \item 需要长时间的迁移期
+    \item 又一个需要学习的新概念
+    \item 可能影响性能
+\end{itemize}
+
+\subsection{Linus Torvalds 的观点}
+
+Linus Torvalds 在邮件列表中表达了对 folio 的总体支持，同时也指出了一些需要注意的问题：
+
+\begin{quote}
+``I like the direction, and I think the folio concept is a good one. The fact that it makes the code clearer about when it's dealing with a single page vs a compound page is a definite improvement.
+
+However, I want to make sure we don't break things. The MM code is complex enough as it is, and we need to be careful about the transition.''
+
+（我喜欢这个方向，folio 的概念很好。它使代码在处理单页和复合页时更加清晰，这绝对是一个改进。
+
+但是，我要确保我们不会破坏任何东西。内存管理代码已经够复杂了，我们需要谨慎地进行过渡。）
+\end{quote}
+
+\section{struct page 的未来}
+
+\subsection{分离策略}
+
+内核社区采取了一种渐进式的策略来重构 \texttt{struct page}：
+
+\begin{enumerate}
+    \item \textbf{引入 folio}：用于页缓存和文件系统
+    \item \textbf{引入 struct slab}：将 slab 相关字段分离
+    \item \textbf{保留 struct page}：作为最底层的页框描述符
+\end{enumerate}
+
+\begin{lstlisting}[caption={struct slab 的分离}]
+/*
+ * struct slab: 从 struct page 分离的 slab 描述符
+ * 这是正在进行的工作（Linux 5.17+）
+ */
+struct slab {
+    unsigned long flags;
+    
+    union {
+        struct list_head slab_list;
+        struct {
+            struct slab *next;
+            int slabs;
+        };
+    };
+    
+    struct kmem_cache *slab_cache;
+    void *freelist;
+    
+    union {
+        unsigned long counters;
+        struct {
+            unsigned inuse:16;
+            unsigned objects:15;
+            unsigned frozen:1;
+        };
+    };
+    
+    atomic_t __page_refcount;
+};
+
+/*
+ * slab 与 page 的转换
+ */
+static inline struct slab *page_slab(struct page *page)
+{
+    VM_BUG_ON_PAGE(!PageSlab(page), page);
+    return (struct slab *)page;
+}
+
+static inline struct page *slab_page(struct slab *slab)
+{
+    return (struct page *)slab;
+}
+\end{lstlisting}
+
+思路跟 folio 一样：新结构体和 \texttt{struct page} 内存布局兼容，直接强转就行。原来挤在联合体里的字段现在各有各的名字，读起来终于像正常代码了。注意 \texttt{page\_slab()} 里的 \texttt{VM\_BUG\_ON\_PAGE(!PageSlab(page), page)}——传了个非 slab 页进来？直接 BUG。比起联合体方案"悄悄读错字段还不报错"，进步不是一点半点。
+
+\subsection{长期愿景}
+
+长期来看，\texttt{struct page} 可能会变成一个更简单的结构，主要包含：
+
+\begin{itemize}
+    \item 页框号（PFN）相关信息
+    \item 基本的引用计数
+    \item 类型标识
+\end{itemize}
+
+而具体的功能则由专门的结构体承担：
+\begin{itemize}
+    \item \texttt{struct folio}：页缓存、文件映射
+    \item \texttt{struct slab}：slab 分配器
+    \item 其他潜在的专用结构
+\end{itemize}
+
+\section{小结}
+
+本章详细分析了 \texttt{struct page} 的历史演变和困境：
+
+\begin{enumerate}
+    \item \textbf{历史演变}：从简单的字节数组到复杂的联合体结构
+    
+    \item \textbf{复合页的引入}：为大页支持带来的复杂性
+    
+    \item \textbf{具体问题}：
+    \begin{itemize}
+        \item API 语义不一致
+        \item 类型安全缺失
+        \item 引用计数混乱
+        \item 字段复用冲突
+    \end{itemize}
+    
+    \item \textbf{社区讨论}：folio 提案的支持与争议
+    
+    \item \textbf{未来方向}：通过引入 folio、slab 等专用结构来简化 \texttt{struct page}
+\end{enumerate}
+
+理解这些历史背景和问题，有助于我们更好地理解 folio 的设计决策。在下一章中，我们将深入探讨 folio 的设计哲学。
+
+
+
+\end{document}

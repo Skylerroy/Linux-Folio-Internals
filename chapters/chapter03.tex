@@ -1,0 +1,2641 @@
+\documentclass[../main.tex]{subfiles}
+\begin{document}
+% 第3章 folio的设计哲学
+\chapter{folio的设计哲学}
+\label{chap:design-philosophy}
+
+\begin{epigraph}
+\textit{``The key insight is that compound pages were a mistake. We should never have had compound pages — we should have had folios from the beginning.''}
+\begin{flushright}
+--- Matthew Wilcox, Linux Kernel Mailing List, 2021
+\end{flushright}
+\end{epigraph}
+
+\section{引言}
+
+任何成功的软件抽象都不仅仅是代码的重构，更是设计思想的体现。Linux内核中的folio便是这样一个典范——它不仅仅是对\texttt{struct page}的简单包装，而是体现了一整套系统性的设计哲学。本章将深入探讨folio背后的设计理念，揭示Matthew Wilcox和其他内核开发者在创造这一抽象时的思考过程。
+
+理解folio的设计哲学，不仅有助于我们更好地使用folio API，更能帮助我们在自己的项目中运用类似的设计原则。正如Linus Torvalds所强调的，好的设计应该``让错误的代码看起来明显是错误的''，而folio正是这一原则的完美实践。
+
+本章将从以下几个维度来剖析folio的设计哲学：
+\begin{itemize}
+    \item Matthew Wilcox的设计理念和动机
+    \item 类型安全在内核开发中的重要性
+    \item 与\texttt{struct page}的兼容性考量
+    \item API设计的核心原则
+    \item 命名约定和代码风格
+    \item 渐进式迁移策略
+    \item 与其他内核改进的协同效应
+    \item 设计中的权衡和取舍
+\end{itemize}
+
+\section{Matthew Wilcox的设计理念}
+
+\subsection{从问题到解决方案的思考过程}
+
+Matthew Wilcox是一位资深的Linux内核开发者，长期从事内存管理和文件系统相关的工作。他在Oracle和多家科技公司的工作经历，使他对内核内存管理的痛点有着深刻的理解。folio的诞生并非一蹴而就，而是经历了多年的思考和实践。
+
+Wilcox最初关注的问题是页缓存（page cache）的处理效率。在处理大文件I/O时，他发现大量的代码时间花费在判断一个页是否是复合页的头页上：
+
+\begin{lstlisting}[language=C,caption={频繁的复合页检查示例},label={lst:compound-check}]
+/*
+ * 这种模式在内核中随处可见
+ * 每次操作页之前都需要确保操作的是头页
+ */
+void some_page_operation(struct page *page)
+{
+    /* 获取头页 - 如果page已经是头页则返回自身 */
+    struct page *head = compound_head(page);
+    
+    /* 检查是否是复合页 */
+    if (PageCompound(head)) {
+        /* 复合页的处理逻辑 */
+        unsigned int order = compound_order(head);
+        /* ... */
+    } else {
+        /* 单页的处理逻辑 */
+        /* ... */
+    }
+}
+
+/*
+ * compound_head() 的实现
+ * 每次调用都需要检查标志位
+ */
+static inline struct page *compound_head(struct page *page)
+{
+    unsigned long head = READ_ONCE(page->compound_head);
+    
+    if (unlikely(head & 1))
+        return (struct page *)(head - 1);
+    return page;
+}
+\end{lstlisting}
+
+这种模式的问题在于：
+
+\begin{enumerate}
+    \item \textbf{性能开销}：每次操作都需要进行条件检查
+    \item \textbf{代码冗余}：相同的检查逻辑分散在各处
+    \item \textbf{语义不清}：函数签名无法表达``我需要的是头页''这一意图
+    \item \textbf{容易出错}：开发者可能忘记调用\texttt{compound\_head()}
+\end{enumerate}
+
+\subsection{``让类型系统为你工作''的理念}
+
+Wilcox的核心洞察是：\textbf{如果我们能在类型层面区分``任意页''和``头页''，编译器就能帮助我们捕获错误}。这一理念来源于类型安全编程的基本原则——通过类型系统来编码程序的约束条件。
+
+\begin{lstlisting}[language=C,caption={folio类型安全的体现},label={lst:folio-type-safety}]
+/*
+ * 旧API：page可能是任意页，调用者需要自己确保
+ */
+void old_page_operation(struct page *page);
+
+/*
+ * 新API：folio类型保证这是一个头页
+ * 编译器会阻止传入尾页
+ */
+void new_folio_operation(struct folio *folio);
+
+/*
+ * 类型转换是显式的，让意图明确
+ */
+struct folio *folio = page_folio(page);  /* page -> folio，会找到头页 */
+struct page *page = folio_page(folio, n); /* folio -> 第n个page */
+\end{lstlisting}
+
+这种设计的优雅之处在于，它将运行时的检查提升到了编译时：
+
+\begin{table}[htbp]
+\centering
+\caption{类型安全带来的改进}
+\label{tab:type-safety-benefits}
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{方面} & \textbf{struct page} & \textbf{struct folio} \\
+\hline
+\hline
+错误检测时机 & 运行时 & 编译时 \\
+\hline
+检查开销 & 每次调用 & 零开销 \\
+\hline
+代码意图 & 隐式约定 & 类型显式表达 \\
+\hline
+API文档 & 需要注释说明 & 类型自解释 \\
+\hline
+重构安全性 & 低（容易遗漏） & 高（编译器保证） \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{``复合页是一个错误''的反思}
+
+Wilcox在多个场合表达过这样的观点：复合页（compound pages）的设计从一开始就是错误的。复合页试图用一种``透明''的方式来表示大页，让上层代码可以``无感知''地处理大页中的任意一页。然而，这种透明性反而带来了混乱：
+
+\begin{lstlisting}[language=C,caption={复合页设计的问题},label={lst:compound-page-problems}]
+/*
+ * 问题1：函数行为依赖于页的类型
+ */
+void ambiguous_function(struct page *page)
+{
+    /* 
+     * 如果page是单页：操作这一页
+     * 如果page是复合页的头页：操作整个复合页
+     * 如果page是复合页的尾页：行为未定义或需要特殊处理
+     * 
+     * 调用者和被调用者对这些情况的理解可能不一致！
+     */
+}
+
+/*
+ * 问题2：引用计数的语义混乱
+ */
+void reference_counting_confusion(struct page *page)
+{
+    /*
+     * get_page() 对单页和复合页的行为不同：
+     * - 单页：增加该页的引用计数
+     * - 复合页的任意页：增加头页的引用计数
+     * 
+     * 但这一行为不是从类型签名中能看出来的！
+     */
+    get_page(page);  /* 实际增加的是哪个计数？ */
+}
+
+/*
+ * 问题3：遍历复合页时的边界问题
+ */
+void iteration_problem(struct page *head, unsigned int order)
+{
+    unsigned int nr_pages = 1 << order;
+    struct page *page;
+    int i;
+    
+    /* 需要手动计算页数，容易出错 */
+    for (i = 0; i < nr_pages; i++) {
+        page = head + i;
+        /* 每个page的flags含义不同！ */
+        if (i == 0) {
+            /* 这是头页，flags有特殊含义 */
+        } else {
+            /* 这是尾页，很多字段是未使用或指向头页的 */
+        }
+    }
+}
+\end{lstlisting}
+
+Wilcox认为，正确的抽象应该是从一开始就区分``一组页''和``单个页''这两个概念。folio正是这一反思的产物——它不试图让大页``看起来像''小页，而是明确地表示``这是一个可能包含多个页的内存单元''。
+
+\subsection{简洁性与正确性的追求}
+
+在设计folio时，Wilcox坚持一个核心原则：\textbf{API应该让正确的代码容易写，让错误的代码难以写}。这体现在以下几个方面：
+
+\begin{lstlisting}[language=C,caption={folio API的简洁性},label={lst:folio-simplicity}]
+/*
+ * 1. 消除歧义的命名
+ */
+/* 旧：page_size() 对复合页返回整个复合页的大小 */
+/* 但名字暗示的是"一页的大小" */
+size_t old_size = page_size(page);
+
+/* 新：folio_size() 明确表示这是folio的大小 */
+size_t new_size = folio_size(folio);
+
+/*
+ * 2. 统一的行为
+ */
+/* folio_nr_pages() 总是返回folio包含的页数 */
+/* 不需要先检查是否是复合页 */
+unsigned long nr = folio_nr_pages(folio);
+
+/*
+ * 3. 自解释的参数
+ */
+/*
+ * 函数签名清楚地表达了期望：
+ * - 接受 struct folio *：期望整个内存单元
+ * - 接受 struct page *：期望单个页
+ */
+void process_memory_unit(struct folio *folio);
+void process_single_page(struct page *page);
+\end{lstlisting}
+
+为什么\texttt{page\_size()}让人不舒服？因为名字说的是``一页的大小''，可实际上对复合页返回的是整个复合页的大小。你得先知道这个潜规则，否则就会掉坑里。换成\texttt{folio\_size()}之后，语义就对了——folio本来就可能包含多个页，返回整个内存单元的大小理所当然。同理，\texttt{folio\_nr\_pages()}让你不用再去想``这到底是不是复合页''。更根本的一点是，函数签名本身变成了文档：看到参数是\texttt{struct folio *}，你就知道它操作的是整个内存单元；看到\texttt{struct page *}，就是单个页。不用翻注释。
+
+\section{类型安全的重要性和实现方式}
+
+\subsection{C语言中的类型安全挑战}
+
+C语言是一门相对``类型松散''的语言，它允许各种隐式类型转换和指针操作。这种灵活性在系统编程中很有价值，但也带来了安全隐患。Linux内核作为一个超大型C项目，一直在探索如何在C的限制下实现更好的类型安全。
+
+\begin{lstlisting}[language=C,caption={C语言类型安全的挑战},label={lst:c-type-safety-challenges}]
+/*
+ * C语言的类型系统不够强大的例子
+ */
+
+/* 1. void* 可以隐式转换为任何指针类型 */
+void *ptr = malloc(sizeof(struct page));
+struct page *page = ptr;  /* 不需要显式转换 */
+struct folio *folio = ptr;  /* 同样不需要，但可能是错误的！ */
+
+/* 2. 指针算术可能违反类型边界 */
+struct page *pages = get_pages();
+struct page *p = pages + 1;  /* 如果pages是folio的一部分，这合法吗？ */
+
+/* 3. 联合体（union）绕过类型检查 */
+union {
+    struct page page;
+    struct folio folio;
+} converter;
+converter.page = *some_page;
+struct folio *f = &converter.folio;  /* 类型系统无法阻止这种滥用 */
+\end{lstlisting}
+
+C语言在类型安全上能给你的帮助实在有限。\texttt{void *}可以悄悄转成任何指针类型，\texttt{malloc}出来的内存往\texttt{struct folio *}上一赋值，编译器不会说半个字。指针算术更危险：\texttt{pages + 1}得到的可能是复合页的尾页，而尾页的字段含义跟头页完全两回事。union就更不用说了，直接在内存层面做类型重解释，编译器管不着。理解了这些限制，你才能体会为什么folio要在C语言现有的框架下费力气做类型区分——不是多此一举，而是没办法的事。
+
+\subsection{folio的类型安全实现}
+
+尽管C语言有其局限性，folio的设计仍然实现了有效的类型安全。核心思想是通过\textbf{不同的类型名}来表示\textbf{不同的语义约束}：
+
+\begin{lstlisting}[language=C,caption={folio的类型定义},label={lst:folio-type-definition}]
+/*
+ * folio的类型定义
+ * 注意：folio在内存布局上与page兼容
+ * 但它们是不同的类型，编译器会区分它们
+ */
+struct folio {
+    /* 第一个union成员，与struct page的开头对齐 */
+    union {
+        struct {
+            unsigned long flags;
+            union {
+                struct list_head lru;
+                struct {
+                    void *__filler;
+                    unsigned int mlock_count;
+                };
+            };
+            struct address_space *mapping;
+            pgoff_t index;
+            union {
+                void *private;
+                swp_entry_t swap;
+            };
+            atomic_t _mapcount;
+            atomic_t _refcount;
+#ifdef CONFIG_MEMCG
+            unsigned long memcg_data;
+#endif
+        };
+        struct page page;
+    };
+    /* folio特有的字段... */
+};
+
+/*
+ * 关键点：struct folio 和 struct page 是不同的类型
+ * 即使它们的内存布局兼容
+ * 编译器会拒绝以下代码：
+ */
+void takes_folio(struct folio *folio);
+void takes_page(struct page *page);
+
+void example(void)
+{
+    struct page *page = get_some_page();
+    struct folio *folio = get_some_folio();
+    
+    /* 编译错误：类型不匹配 */
+    // takes_folio(page);  /* 错误！ */
+    // takes_page(folio);  /* 错误！ */
+    
+    /* 必须使用显式转换函数 */
+    takes_folio(page_folio(page));  /* 正确 */
+    takes_page(&folio->page);        /* 正确 */
+}
+\end{lstlisting}
+
+关键在于folio内部通过union嵌入了一个完整的\texttt{struct page}，所以两者在内存布局上是兼容的。但对编译器来说，\texttt{struct folio *}和\texttt{struct page *}就是两个不同的类型——你没法把一个直接传给期望另一个的函数，编译器会报错。
+
+想要在两种类型之间转换？必须走显式的转换函数。\texttt{page\_folio()}帮你从page找到它所属的folio（自动定位到头页），\texttt{\&folio->page}则取出folio里第一个page的地址。这就迫使你在跨越类型边界时表明意图，而不是稀里糊涂地混用。
+
+\subsection{编译时检查的威力}
+
+类型安全的最大价值在于将错误检测提前到编译时。这意味着很多bug在代码提交之前就能被发现：
+
+\begin{lstlisting}[language=C,caption={编译时类型检查示例},label={lst:compile-time-check}]
+/*
+ * 场景：开发者错误地传递了尾页
+ */
+
+/* 旧代码：运行时才能发现问题 */
+void old_approach(struct page *page)
+{
+    /* 
+     * 如果page是尾页，下面的操作可能产生错误结果
+     * 但代码能够编译通过
+     */
+    unsigned long flags = page->flags;  /* 尾页的flags含义不同！ */
+    atomic_inc(&page->_refcount);       /* 应该操作头页的计数！ */
+}
+
+/* 新代码：编译时就能发现类型错误 */
+void new_approach(struct folio *folio)
+{
+    /*
+     * 如果调用者试图传入尾页，必须先转换为folio
+     * page_folio() 函数会自动返回头页对应的folio
+     * 类型系统强制进行了正确的处理
+     */
+    unsigned long flags = folio->flags;  /* folio->flags 总是有意义的 */
+    folio_ref_inc(folio);                /* 操作正确的引用计数 */
+}
+
+/*
+ * 转换函数的实现确保了语义正确性
+ */
+static inline struct folio *page_folio(struct page *page)
+{
+    unsigned long head = READ_ONCE(page->compound_head);
+    
+    /*
+     * 如果page是尾页，compound_head的最低位被设置为1
+     * 其余位是头页的地址
+     */
+    if (unlikely(head & 1))
+        return (struct folio *)(head - 1);
+    return (struct folio *)page;
+}
+\end{lstlisting}
+
+对比一下两种写法就明白了。\texttt{old\_approach}接受\texttt{struct page *}，如果有人传进来一个尾页指针，编译器不会拦你，代码照常编译。但运行起来就出问题了——尾页的\texttt{flags}含义跟头页不一样，对尾页的\texttt{\_refcount}做原子操作更是大错特错。这种bug藏得很深，排查起来让人头疼。
+
+换成\texttt{new\_approach}，参数类型是\texttt{struct folio *}，从类型上就保证了这是头页。调用者手里如果只有\texttt{struct page *}，那就必须先过一遍\texttt{page\_folio()}。让我们看看\texttt{page\_folio()}干了什么：它检查\texttt{compound\_head}字段的最低位，如果是1就说明这是尾页，高位存着头页地址；否则page本身就是头页。换句话说，类型转换的过程顺手就把尾页的问题处理了。原来可能在运行时炸掉的bug，现在被挡在了一个明确的转换步骤上。
+
+\subsection{静态分析工具的支持}
+
+类型安全还使得静态分析工具能够更好地检查代码。Linux内核使用了多种静态分析工具，包括：
+
+\begin{itemize}
+    \item \textbf{sparse}：Linux内核的语义检查器
+    \item \textbf{smatch}：静态分析工具
+    \item \textbf{Coverity}：商业静态分析工具
+    \item \textbf{GCC/Clang警告}：编译器的内置检查
+\end{itemize}
+
+\begin{lstlisting}[language=C,caption={静态分析友好的设计},label={lst:static-analysis}]
+/*
+ * 使用 __force 标注来捕获不安全的转换
+ */
+#define page_to_folio(page) ({                          \
+    typeof(page) _page = page;                          \
+    /* sparse会检查这个转换 */                           \
+    (struct folio __force *)compound_head(_page);      \
+})
+
+/*
+ * 使用 __must_check 确保返回值被检查
+ */
+struct folio * __must_check folio_try_get(struct folio *folio);
+
+/*
+ * 使用 __always_inline 确保编译器优化
+ */
+static __always_inline unsigned long folio_nr_pages(struct folio *folio)
+{
+    return compound_nr(&folio->page);
+}
+
+/*
+ * 使用 BUILD_BUG_ON 在编译时检查假设
+ */
+static inline void folio_sanity_check(void)
+{
+    /* 确保folio和page的关键字段对齐 */
+    BUILD_BUG_ON(offsetof(struct folio, flags) != 
+                 offsetof(struct page, flags));
+    BUILD_BUG_ON(offsetof(struct folio, _refcount) != 
+                 offsetof(struct page, _refcount));
+}
+\end{lstlisting}
+
+这里用到了内核里几个重要的编译器扩展。\texttt{\_\_force}配合sparse，能在类型转换时产生警告，帮你发现不安全的转换。\texttt{\_\_must\_check}防止你忽略\texttt{folio\_try\_get}这类可能失败的函数的返回值。\texttt{\_\_always\_inline}保证\texttt{folio\_nr\_pages}这种小函数一定被内联，不留函数调用开销。
+
+但真正值得注意的是\texttt{BUILD\_BUG\_ON}。它在编译期验证folio和page的关键字段偏移量是否一致。假如有人改了某个结构体的布局导致对齐被破坏，编译直接就挂了——而不是让你在运行时面对莫名其妙的内存损坏。编译时炸总比运行时炸强。
+
+\section{与struct page的兼容性设计}
+
+\subsection{内存布局的考虑}
+
+folio设计中最精妙的部分之一是它与\texttt{struct page}的内存布局兼容性。这种兼容性确保了：
+
+\begin{enumerate}
+    \item 现有代码可以继续工作
+    \item 新旧代码可以共存
+    \item 迁移可以渐进式进行
+    \item 运行时开销为零
+\end{enumerate}
+
+\begin{lstlisting}[language=C,caption={folio与page的内存布局对齐},label={lst:memory-layout}]
+/*
+ * struct page 的简化布局（Linux 6.x）
+ */
+struct page {
+    unsigned long flags;              /* 偏移 0 */
+    union {
+        struct list_head lru;         /* 偏移 8 */
+        /* 其他联合成员... */
+    };
+    struct address_space *mapping;    /* 偏移 24 */
+    pgoff_t index;                    /* 偏移 32 */
+    unsigned long private;            /* 偏移 40 */
+    atomic_t _mapcount;               /* 偏移 48 */
+    atomic_t _refcount;               /* 偏移 52 */
+    /* ... */
+};
+
+/*
+ * struct folio 的布局确保与page对齐
+ */
+struct folio {
+    union {
+        struct {
+            /* 这些字段与page的对应字段完全对齐 */
+            unsigned long flags;          /* 偏移 0 - 与page对齐 */
+            union {
+                struct list_head lru;     /* 偏移 8 - 与page对齐 */
+                /* ... */
+            };
+            struct address_space *mapping; /* 偏移 24 - 与page对齐 */
+            pgoff_t index;                 /* 偏移 32 - 与page对齐 */
+            unsigned long private;         /* 偏移 40 - 与page对齐 */
+            atomic_t _mapcount;            /* 偏移 48 - 与page对齐 */
+            atomic_t _refcount;            /* 偏移 52 - 与page对齐 */
+        };
+        /* 直接嵌入page，确保完美对齐 */
+        struct page page;
+    };
+    /* folio特有字段从这里开始 */
+    union {
+        struct {
+            /* 第二个page槽位的复用 */
+            unsigned long _flags_1;
+            unsigned long _head_1;
+            /* ... */
+        };
+        struct page __page_1;
+    };
+    /* 更多folio特有字段... */
+};
+
+/*
+ * 验证布局对齐的编译时检查
+ */
+static void layout_check(void)
+{
+    BUILD_BUG_ON(offsetof(struct folio, flags) != 
+                 offsetof(struct page, flags));
+    BUILD_BUG_ON(offsetof(struct folio, mapping) != 
+                 offsetof(struct page, mapping));
+    BUILD_BUG_ON(offsetof(struct folio, index) != 
+                 offsetof(struct page, index));
+    BUILD_BUG_ON(offsetof(struct folio, _mapcount) != 
+                 offsetof(struct page, _mapcount));
+    BUILD_BUG_ON(offsetof(struct folio, _refcount) != 
+                 offsetof(struct page, _refcount));
+}
+\end{lstlisting}
+
+在64位系统上，folio和page的关键字段处于完全相同的偏移位置：\texttt{flags}在0，\texttt{lru}在8，\texttt{mapping}在24，\texttt{index}在32，以此类推。怎么做到的？folio直接嵌入了一个\texttt{struct page page}成员，布局自然就对齐了。
+
+有意思的是folio的第二个page槽位（\texttt{\_\_page\_1}）。它复用了复合页中第二个页帧的空间来放folio特有的元数据，比如\texttt{\_flags\_1}和\texttt{\_head\_1}。\texttt{layout\_check}里的一串\texttt{BUILD\_BUG\_ON}负责在编译期守住这个对齐不被破坏——谁要是改了结构体导致偏移量不一致，编译就过不了。因为布局完全对齐，folio指针和page指针之间的转换不需要任何数据拷贝，纯粹是换个类型标签。
+
+\subsection{零成本转换}
+
+由于内存布局的对齐，folio和page之间的转换可以是零成本的——仅仅是指针类型的改变，不需要任何运行时数据拷贝或转换：
+
+\begin{lstlisting}[language=C,caption={零成本类型转换},label={lst:zero-cost-conversion}]
+/*
+ * folio到page的转换
+ * 仅仅是取出嵌入的page成员的地址
+ * 编译后的代码没有任何实际操作
+ */
+static inline struct page *folio_page(struct folio *folio, size_t n)
+{
+    /*
+     * &folio->page 返回folio中第一个page的地址
+     * 由于folio的地址就是第一个page的地址
+     * 这实际上是一个无操作（no-op）
+     */
+    return &folio->page + n;
+}
+
+/*
+ * page到folio的转换（假设page是头页）
+ * 同样是零成本的指针转换
+ */
+static inline struct folio *page_folio(struct page *page)
+{
+    unsigned long head = READ_ONCE(page->compound_head);
+    
+    if (unlikely(head & 1))
+        return (struct folio *)(head - 1);
+    return (struct folio *)page;
+}
+
+/*
+ * 编译器优化后的代码示例
+ * 对于已知是头页的情况
+ */
+void optimized_example(struct folio *folio)
+{
+    struct page *page = &folio->page;
+    
+    /*
+     * 编译后，folio和page的值完全相同
+     * 只是类型不同，让编译器知道我们的意图
+     * 
+     * 生成的汇编代码类似于：
+     * ; folio 在 %rdi 中
+     * ; page 也在 %rdi 中（没有任何实际指令）
+     */
+}
+\end{lstlisting}
+
+\texttt{folio\_page}做的事情很简单：\texttt{\&folio->page + n}。由于\texttt{\&folio->page}的地址就是folio自身的地址（union的第一个成员），当n为0时编译器根本不会生成任何指令，这就是个no-op。
+
+反过来呢？\texttt{page\_folio}读取page的\texttt{compound\_head}字段，最低位为1说明是尾页，把最低位清掉就得到了头页也就是folio的地址；最低位为0就说明page本身就是头页，直接强制转换类型即可。这里\texttt{READ\_ONCE}是必要的——在并发场景下，你不希望编译器把这个字段读两次然后得到不一致的结果。看\texttt{optimized\_example}就更清楚了：如果你已经知道手里拿的是头页，folio和page的指针值完全相同，汇编层面就是同一个寄存器，零开销。
+
+\subsection{API层面的兼容性}
+
+folio引入了一套新的API，但这些API在设计上考虑了与旧API的兼容性：
+
+\begin{lstlisting}[language=C,caption={API兼容性设计},label={lst:api-compatibility}]
+/*
+ * 1. 保留page API用于需要单页操作的场景
+ */
+/* 旧API继续可用 */
+struct page *alloc_page(gfp_t gfp);
+void __free_page(struct page *page);
+void get_page(struct page *page);
+void put_page(struct page *page);
+
+/*
+ * 2. 新增folio API用于内存单元操作
+ */
+struct folio *folio_alloc(gfp_t gfp, unsigned int order);
+void folio_put(struct folio *folio);
+void folio_get(struct folio *folio);
+void folio_lock(struct folio *folio);
+
+/*
+ * 3. 提供转换函数在两套API之间桥接
+ */
+static inline struct folio *page_folio(struct page *page);
+static inline struct page *folio_page(struct folio *folio, size_t n);
+
+/*
+ * 4. 某些函数同时有page和folio版本
+ */
+/* page版本 - 用于单页 */
+void SetPageDirty(struct page *page);
+
+/* folio版本 - 用于folio */
+void folio_mark_dirty(struct folio *folio);
+
+/*
+ * 5. 渐进式迁移：内部实现可以是相同的
+ */
+void SetPageDirty(struct page *page)
+{
+    struct folio *folio = page_folio(page);
+    folio_mark_dirty(folio);
+}
+\end{lstlisting}
+
+旧的\texttt{alloc\_page}、\texttt{get\_page}、\texttt{put\_page}这些函数都还在，现有代码不用改。新增的\texttt{folio\_alloc}、\texttt{folio\_get}之类提供了类型安全的替代方案。两套API通过\texttt{page\_folio}和\texttt{folio\_page}桥接。
+
+有趣的是最后一段：\texttt{SetPageDirty}内部其实就是转成folio后调\texttt{folio\_mark\_dirty}。也就是说核心逻辑只维护一份，page版本只是个壳。旧代码继续用page API没问题，新代码直接用folio API也没问题，运行时行为完全一样。渐进式迁移就是靠这种方式撑起来的。
+
+\subsection{二进制兼容性}
+
+folio的设计还考虑了二进制兼容性，确保内核模块在一定程度上的前向和后向兼容：
+
+\begin{lstlisting}[language=C,caption={二进制兼容性考虑},label={lst:binary-compatibility}]
+/*
+ * 使用EXPORT_SYMBOL导出的符号保持兼容
+ */
+/* 旧符号继续可用 */
+EXPORT_SYMBOL(alloc_pages);
+EXPORT_SYMBOL(__free_pages);
+EXPORT_SYMBOL(get_page);
+EXPORT_SYMBOL(put_page);
+
+/* 新符号添加，不影响旧符号 */
+EXPORT_SYMBOL(folio_alloc);
+EXPORT_SYMBOL(folio_put);
+EXPORT_SYMBOL(folio_get);
+
+/*
+ * 结构体大小的稳定性
+ */
+/* 
+ * folio在mem_map数组中的存储与page一致
+ * 每个folio的"头"占用一个page槽位
+ * 大folio的"尾"继续占用后续的page槽位
+ * 这确保了pfn_to_page()等函数继续工作
+ */
+static inline struct page *pfn_to_page(unsigned long pfn)
+{
+    /* 实现不变 */
+    return mem_map + pfn;
+}
+
+static inline struct folio *pfn_to_folio(unsigned long pfn)
+{
+    return page_folio(pfn_to_page(pfn));
+}
+\end{lstlisting}
+
+旧符号通过\texttt{EXPORT\_SYMBOL}照常导出，已编译的内核模块不需要重新编译。folio的符号作为新增项加入，不影响已有的符号表。
+
+让我们想想folio在\texttt{mem\_map}数组里是怎么存的。\texttt{mem\_map}的每个元素是一个\texttt{struct page}，folio的``头''占一个槽位，大folio的``尾''占后续槽位。所以\texttt{pfn\_to\_page()}这些函数根本不用改。新加的\texttt{pfn\_to\_folio()}也就是在\texttt{pfn\_to\_page()}上面包一层\texttt{page\_folio()}，没什么花哨的。
+
+\section{API设计原则}
+
+\subsection{清晰性原则}
+
+folio API的第一个设计原则是\textbf{清晰性}——每个函数的名字应该准确描述其功能，不留歧义：
+
+\begin{lstlisting}[language=C,caption={清晰性原则示例},label={lst:clarity-principle}]
+/*
+ * 反例：旧API中的歧义
+ */
+/* 
+ * page_size() - 返回什么的大小？
+ * - 如果是单页，返回PAGE_SIZE
+ * - 如果是复合页，返回整个复合页的大小
+ * 名字没有表达这种条件行为
+ */
+size_t old_size = page_size(page);
+
+/*
+ * 正例：folio API的清晰命名
+ */
+/*
+ * folio_size() - 清楚地表示这是folio的大小
+ * 调用者已经知道folio可能包含多页
+ * 所以行为是清晰的
+ */
+size_t new_size = folio_size(folio);
+
+/*
+ * 更多清晰命名的例子
+ */
+/* 获取folio包含的页数 */
+unsigned long nr = folio_nr_pages(folio);
+
+/* 获取folio的阶数（2的幂次） */
+unsigned int order = folio_order(folio);
+
+/* 获取folio在文件中的索引 */
+pgoff_t index = folio_index(folio);
+
+/* 检查folio是否被锁定 */
+bool locked = folio_test_locked(folio);
+
+/* 标记folio为脏 */
+void folio_mark_dirty(struct folio *folio);
+
+/* 等待folio解锁 */
+void folio_wait_locked(struct folio *folio);
+\end{lstlisting}
+
+\texttt{page\_size()}这个名字就有问题——听起来是``一页的大小''，但对复合页它返回的是整个复合页的大小。你不读代码根本猜不到它有这种条件行为。\texttt{folio\_size()}就没这个问题：folio本来就可能包含多个页，返回整体大小合情合理。
+
+其他函数也是一样的思路。\texttt{folio\_nr\_pages}、\texttt{folio\_order}、\texttt{folio\_index}、\texttt{folio\_test\_locked}、\texttt{folio\_mark\_dirty}、\texttt{folio\_wait\_locked}——看名字就知道干什么。``folio''前缀加上动词加上描述符，不用翻文档。
+
+\subsection{一致性原则}
+
+API设计的第二个原则是\textbf{一致性}——相似的操作应该有相似的接口：
+
+\begin{lstlisting}[language=C,caption={一致性原则示例},label={lst:consistency-principle}]
+/*
+ * 1. 命名一致性：相同的命名模式
+ */
+/* folio_test_xxx() - 测试标志位 */
+bool folio_test_locked(struct folio *folio);
+bool folio_test_dirty(struct folio *folio);
+bool folio_test_writeback(struct folio *folio);
+bool folio_test_uptodate(struct folio *folio);
+bool folio_test_referenced(struct folio *folio);
+
+/* folio_set_xxx() - 设置标志位 */
+void folio_set_dirty(struct folio *folio);
+void folio_set_uptodate(struct folio *folio);
+void folio_set_referenced(struct folio *folio);
+
+/* folio_clear_xxx() - 清除标志位 */
+void folio_clear_dirty(struct folio *folio);
+void folio_clear_referenced(struct folio *folio);
+
+/*
+ * 2. 参数顺序一致性
+ */
+/* 所有folio操作的第一个参数都是folio */
+void folio_lock(struct folio *folio);
+void folio_unlock(struct folio *folio);
+int folio_trylock(struct folio *folio);
+void folio_mark_dirty(struct folio *folio);
+void folio_wait_locked(struct folio *folio);
+
+/*
+ * 3. 返回值一致性
+ */
+/* 测试函数返回bool */
+bool folio_test_locked(struct folio *folio);
+bool folio_test_dirty(struct folio *folio);
+
+/* 尝试操作返回成功/失败 */
+int folio_trylock(struct folio *folio);  /* 成功返回1，失败返回0 */
+
+/* 计数操作返回数值 */
+unsigned long folio_nr_pages(struct folio *folio);
+unsigned int folio_order(struct folio *folio);
+\end{lstlisting}
+
+三个维度的一致性在这里体现得很清楚。命名上，测试标志位一律\texttt{folio\_test\_xxx}，设置一律\texttt{folio\_set\_xxx}，清除一律\texttt{folio\_clear\_xxx}。你学会一个模式，其他的都能猜到。参数顺序上，\texttt{struct folio *}永远是第一个参数——跟面向对象里的\texttt{this}指针一个意思。返回值上，测试函数返回\texttt{bool}，trylock这种返回int表示成功或失败，\texttt{folio\_nr\_pages}之类返回数值。
+
+这看似是小事，但想想旧page API的状况：\texttt{lock\_page}、\texttt{SetPageDirty}、\texttt{set\_page\_dirty}、\texttt{PageDirty}——同一类操作至少三种命名风格。你得逐个记住每个函数叫什么。folio API把这种记忆负担基本消除了。
+
+\subsection{最小惊讶原则}
+
+\textbf{最小惊讶原则}（Principle of Least Astonishment）是API设计的黄金法则——API的行为应该符合大多数开发者的直觉：
+
+\begin{lstlisting}[language=C,caption={最小惊讶原则示例},label={lst:least-astonishment}]
+/*
+ * 惊讶的例子（旧API）
+ */
+void surprising_behavior(struct page *page)
+{
+    /*
+     * put_page() 可能会释放整个复合页
+     * 即使你只是想"放下"一个尾页
+     * 这可能导致意外的内存释放
+     */
+    put_page(tail_page);  /* 危险！可能释放头页 */
+    
+    /*
+     * get_page() 对复合页的尾页会增加头页的引用计数
+     * 这不是从函数名能推断出来的
+     */
+    get_page(tail_page);  /* 实际上增加的是head的计数 */
+}
+
+/*
+ * 不惊讶的例子（folio API）
+ */
+void expected_behavior(struct folio *folio)
+{
+    /*
+     * folio_put() 明确操作的是folio
+     * folio的定义就是一个内存单元
+     * 所以释放行为是预期的
+     */
+    folio_put(folio);  /* 清晰：减少folio的引用计数 */
+    
+    /*
+     * folio_get() 增加folio的引用计数
+     * 不存在"尾页"的概念，所以没有歧义
+     */
+    folio_get(folio);  /* 清晰：增加folio的引用计数 */
+}
+
+/*
+ * 另一个例子：folio_address() vs page_address()
+ */
+void *get_address(struct folio *folio, struct page *page)
+{
+    /*
+     * page_address() 返回单页的虚拟地址
+     * 对于复合页的尾页，返回的是尾页的地址而非头页
+     * 这可能符合也可能不符合预期
+     */
+    void *p1 = page_address(page);
+    
+    /*
+     * folio_address() 总是返回folio的起始地址
+     * 即复合页的头页地址
+     * 行为是一致和可预测的
+     */
+    void *p2 = folio_address(folio);
+    
+    return p2;
+}
+\end{lstlisting}
+
+旧API里的坑就在于这些``隐式的间接行为''。你对一个尾页调\texttt{put\_page}，它可能把整个复合页给释放了。你对尾页调\texttt{get\_page}，增加的其实是头页的引用计数。这些行为从函数名和参数上看不出来，出了bug你可能排查半天都想不到这里。
+
+folio API干脆把``尾页''这个概念从接口层面消灭了。\texttt{folio\_put}就是减少folio的引用计数，\texttt{folio\_get}就是增加，没有任何隐含的间接操作。\texttt{folio\_address()}也一样——总是返回folio的起始地址，不会因为你碰巧拿着尾页就给你尾页的地址。你要访问folio里特定的偏移位置？自己在起始地址上加偏移，意图清清楚楚。
+
+\subsection{正交性原则}
+
+\textbf{正交性}意味着不同的功能应该通过不同的、独立的接口来提供，而不是将多种功能混合在一个接口中：
+
+\begin{lstlisting}[language=C,caption={正交性原则示例},label={lst:orthogonality}]
+/*
+ * 非正交设计（避免）
+ */
+/* 
+ * 这个函数做了太多事情：
+ * 1. 查找folio
+ * 2. 获取引用
+ * 3. 可能等待锁
+ * 4. 可能创建新folio
+ */
+struct folio *complex_find_or_create_folio_and_lock(
+    struct address_space *mapping,
+    pgoff_t index,
+    gfp_t gfp,
+    bool create,
+    bool lock,
+    bool wait);
+
+/*
+ * 正交设计（推荐）
+ */
+/* 单独的查找功能 */
+struct folio *filemap_get_folio(struct address_space *mapping, 
+                                 pgoff_t index);
+
+/* 单独的创建功能 */
+struct folio *filemap_alloc_folio(gfp_t gfp, unsigned int order);
+
+/* 单独的加入功能 */
+int filemap_add_folio(struct address_space *mapping,
+                      struct folio *folio, 
+                      pgoff_t index, 
+                      gfp_t gfp);
+
+/* 单独的锁定功能 */
+void folio_lock(struct folio *folio);
+
+/* 组合使用实现复杂功能 */
+struct folio *find_or_create_folio(struct address_space *mapping,
+                                    pgoff_t index,
+                                    gfp_t gfp)
+{
+    struct folio *folio;
+    
+    /* 先尝试查找 */
+    folio = filemap_get_folio(mapping, index);
+    if (folio)
+        return folio;
+    
+    /* 不存在则创建 */
+    folio = filemap_alloc_folio(gfp, 0);
+    if (!folio)
+        return NULL;
+    
+    /* 加入mapping */
+    if (filemap_add_folio(mapping, folio, index, gfp)) {
+        folio_put(folio);
+        /* 可能其他线程已经加入，再次查找 */
+        return filemap_get_folio(mapping, index);
+    }
+    
+    return folio;
+}
+\end{lstlisting}
+
+看看反例就知道了：\texttt{complex\_find\_or\_create\_folio\_and\_lock}，三个布尔参数控制行为，$2^3=8$种组合。你敢说自己能记住每种组合的行为吗？这种函数写出来容易，测出来难，改起来更难。
+
+正交设计的做法是把功能拆开。\texttt{filemap\_get\_folio}只管查找，\texttt{filemap\_alloc\_folio}只管分配，\texttt{filemap\_add\_folio}只管加入映射，\texttt{folio\_lock}只管锁定。需要``查找或创建''？把这些基础函数组合起来就行。看看\texttt{find\_or\_create\_folio}的逻辑就很清楚：先查，没有就分配，分配完加入mapping，加入失败（可能别的线程抢先了）就再查一次。每一步都是透明的，每个基础操作都可以单独测试和优化。
+
+\subsection{可组合性原则}
+
+好的API应该是\textbf{可组合的}——小的、简单的功能可以组合成复杂的功能：
+
+\begin{lstlisting}[language=C,caption={可组合性示例},label={lst:composability}]
+/*
+ * 基础操作：获取、释放、锁定、解锁
+ */
+void folio_get(struct folio *folio);
+void folio_put(struct folio *folio);
+void folio_lock(struct folio *folio);
+void folio_unlock(struct folio *folio);
+int folio_trylock(struct folio *folio);
+
+/*
+ * 组合操作：获取并锁定
+ */
+struct folio *folio_get_and_lock(struct folio *folio)
+{
+    folio_get(folio);
+    folio_lock(folio);
+    return folio;
+}
+
+/*
+ * 组合操作：解锁并释放
+ */
+void folio_unlock_and_put(struct folio *folio)
+{
+    folio_unlock(folio);
+    folio_put(folio);
+}
+
+/*
+ * 实际内核中的组合示例：folio_grab_cache()
+ * 从页缓存获取folio并增加引用计数
+ */
+struct folio *filemap_get_folio(struct address_space *mapping, 
+                                 pgoff_t index)
+{
+    XA_STATE(xas, &mapping->i_pages, index);
+    struct folio *folio;
+    
+    rcu_read_lock();
+repeat:
+    folio = xas_load(&xas);
+    if (!folio || xas_retry(&xas, folio))
+        goto repeat;
+    
+    /* 尝试获取引用 */
+    if (!folio_try_get_rcu(folio))
+        goto repeat;
+    
+    /* 验证folio仍然有效 */
+    if (unlikely(folio != xas_reload(&xas))) {
+        folio_put(folio);
+        goto repeat;
+    }
+    
+    rcu_read_unlock();
+    return folio;
+}
+\end{lstlisting}
+
+基础操作就那几个：\texttt{folio\_get}/\texttt{folio\_put}管引用计数，\texttt{folio\_lock}/\texttt{folio\_unlock}/\texttt{folio\_trylock}管锁。自由组合就能搭出\texttt{folio\_get\_and\_lock}、\texttt{folio\_unlock\_and\_put}这样的复合操作。
+
+\texttt{filemap\_get\_folio}是个很好的实际例子。它从页缓存的XArray中查找folio，整个过程在RCU读保护下进行。先用\texttt{xas\_load}加载folio指针，再用\texttt{folio\_try\_get\_rcu}拿引用计数。但拿到引用之后还不算完——\texttt{xas\_reload}会重新加载XArray条目，确认folio没有在你拿引用的这段时间里被别人换掉。如果被换了，释放引用重来。整个函数就是XArray操作、RCU保护、folio引用计数三个独立机制的组合，各管各的，你可以分开理解每一部分。
+
+\section{命名约定和代码风格}
+
+\subsection{folio命名约定}
+
+folio API采用了一套系统性的命名约定，使得代码自文档化：
+
+\begin{lstlisting}[language=C,caption={folio命名约定},label={lst:folio-naming}]
+/*
+ * 1. 前缀约定
+ */
+/* folio_xxx() - folio的实例方法 */
+void folio_lock(struct folio *folio);
+void folio_mark_dirty(struct folio *folio);
+unsigned long folio_nr_pages(struct folio *folio);
+
+/* folio_test_xxx() - 测试folio标志位 */
+bool folio_test_locked(struct folio *folio);
+bool folio_test_dirty(struct folio *folio);
+
+/* folio_set_xxx() / folio_clear_xxx() - 设置/清除标志位 */
+void folio_set_dirty(struct folio *folio);
+void folio_clear_dirty(struct folio *folio);
+
+/*
+ * 2. 动词约定
+ */
+/* get/put - 引用计数操作 */
+void folio_get(struct folio *folio);    /* 增加引用 */
+void folio_put(struct folio *folio);    /* 减少引用 */
+
+/* lock/unlock - 锁操作 */
+void folio_lock(struct folio *folio);   /* 获取锁 */
+void folio_unlock(struct folio *folio); /* 释放锁 */
+int folio_trylock(struct folio *folio); /* 尝试获取锁 */
+
+/* wait - 等待操作 */
+void folio_wait_locked(struct folio *folio);
+void folio_wait_writeback(struct folio *folio);
+
+/* mark - 标记操作（可能有副作用） */
+void folio_mark_dirty(struct folio *folio);
+void folio_mark_uptodate(struct folio *folio);
+
+/*
+ * 3. 后缀约定
+ */
+/* _rcu - 需要RCU读保护 */
+bool folio_try_get_rcu(struct folio *folio);
+
+/* _irq - 影响中断状态 */
+void folio_lock_irq(struct folio *folio);
+
+/* _irqsave - 保存并禁用中断 */
+void folio_lock_irqsave(struct folio *folio, unsigned long *flags);
+
+/* _nr - 返回数量 */
+unsigned long folio_nr_pages(struct folio *folio);
+
+/*
+ * 4. 对比：page API的命名（不太一致）
+ */
+/* Page API使用多种命名风格 */
+void lock_page(struct page *page);    /* 动词_名词 */
+void SetPageDirty(struct page *page); /* 驼峰式 */
+void set_page_dirty(struct page *page); /* 下划线式 */
+int PageDirty(struct page *page);     /* 驼峰式测试 */
+\end{lstlisting}
+
+四类约定各有分工。前缀区分了普通操作（\texttt{folio\_xxx}）、标志位测试（\texttt{folio\_test\_xxx}）和标志位修改（\texttt{folio\_set\_xxx}/\texttt{folio\_clear\_xxx}）。动词约定也很规律：\texttt{get/put}管引用计数，\texttt{lock/unlock}管锁，\texttt{wait}管等待，\texttt{mark}用于带副作用的标记。后缀标识特殊上下文：\texttt{\_rcu}要求RCU读保护，\texttt{\_irq}会动中断状态，\texttt{\_irqsave}保存并禁用中断。
+
+再看看旧page API的命名：\texttt{lock\_page}是``动词\_名词''，\texttt{SetPageDirty}是驼峰式，\texttt{set\_page\_dirty}是下划线式，\texttt{PageDirty}又是另一种驼峰。同一类操作至少三种命名风格，你说怎么记？folio API把这些统统理顺了。
+
+\subsection{代码风格指南}
+
+folio相关代码遵循Linux内核的编码风格，同时有一些特定的约定：
+
+\begin{lstlisting}[language=C,caption={folio代码风格},label={lst:folio-code-style}]
+/*
+ * 1. 参数顺序
+ * - folio作为第一个参数
+ * - 输出参数放在输入参数之后
+ */
+/* 正确 */
+void folio_copy(struct folio *folio, const void *src, size_t len);
+/* 不推荐 */
+void folio_copy(const void *src, struct folio *folio, size_t len);
+
+/*
+ * 2. 错误处理
+ * - 返回负数错误码（-Exxx）
+ * - 返回NULL表示分配失败
+ * - 使用likely/unlikely标注常见路径
+ */
+struct folio *folio_alloc(gfp_t gfp, unsigned int order)
+{
+    struct folio *folio;
+    
+    folio = (struct folio *)alloc_pages(gfp, order);
+    if (unlikely(!folio))
+        return NULL;
+        
+    if (order > 0)
+        prep_compound_page(&folio->page, order);
+        
+    return folio;
+}
+
+/*
+ * 3. 内联函数的使用
+ * - 小函数使用static inline
+ * - 性能关键路径使用__always_inline
+ */
+static __always_inline unsigned long folio_size(struct folio *folio)
+{
+    return PAGE_SIZE << folio_order(folio);
+}
+
+/*
+ * 4. 断言和验证
+ * - 使用VM_BUG_ON()检查不应该发生的情况
+ * - 使用WARN_ON()检查可能发生但需要警告的情况
+ */
+void folio_lock(struct folio *folio)
+{
+    /* folio不能为NULL */
+    VM_BUG_ON_FOLIO(!folio, folio);
+    
+    /* folio不能已经被释放 */
+    VM_BUG_ON_FOLIO(folio_ref_count(folio) <= 0, folio);
+    
+    might_sleep();
+    /* 实际锁定逻辑... */
+}
+
+/*
+ * 5. 文档注释
+ * - 使用内核文档格式
+ */
+/**
+ * folio_lock() - Lock a folio.
+ * @folio: The folio to lock.
+ *
+ * This function acquires the folio lock. It will sleep if the
+ * folio is already locked, so it cannot be called from atomic
+ * context.
+ *
+ * Context: May sleep. Must be called in process context.
+ * Return: Nothing.
+ */
+void folio_lock(struct folio *folio);
+\end{lstlisting}
+
+这些风格约定大部分跟内核通用惯例一致。folio始终作为第一个参数。返回NULL表示分配失败。小函数用\texttt{\_\_always\_inline}。\texttt{unlikely}标注异常路径帮助分支预测。
+
+值得多说几句的是断言部分。\texttt{folio\_lock}里的\texttt{VM\_BUG\_ON\_FOLIO}检查folio非空、引用计数大于0——这些在\texttt{CONFIG\_DEBUG\_VM}开启时执行，生产环境直接被优化掉，零开销。\texttt{might\_sleep()}则是给lockdep看的，它告诉锁检测工具``我可能睡眠''，如果你在原子上下文里调了这个函数，lockdep会叫。文档注释用的是标准kerneldoc格式，能被自动化工具提取。
+
+\subsection{宏定义约定}
+
+folio使用了大量的宏来实现代码生成和编译时检查：
+
+\begin{lstlisting}[language=C,caption={folio相关宏定义},label={lst:folio-macros}]
+/*
+ * 1. 标志位操作宏
+ */
+#define FOLIO_FLAG(name, page)                                  \
+static __always_inline bool folio_test_##name(struct folio *folio) \
+{                                                               \
+    return test_bit(PG_##name, folio_flags(folio, page));      \
+}                                                               \
+static __always_inline void folio_set_##name(struct folio *folio) \
+{                                                               \
+    set_bit(PG_##name, folio_flags(folio, page));              \
+}                                                               \
+static __always_inline void folio_clear_##name(struct folio *folio) \
+{                                                               \
+    clear_bit(PG_##name, folio_flags(folio, page));            \
+}
+
+/* 使用宏生成标志位操作函数 */
+FOLIO_FLAG(locked, 0)     /* folio_test_locked, folio_set_locked, ... */
+FOLIO_FLAG(dirty, 0)      /* folio_test_dirty, folio_set_dirty, ... */
+FOLIO_FLAG(writeback, 0)  /* folio_test_writeback, ... */
+FOLIO_FLAG(uptodate, 0)   /* folio_test_uptodate, ... */
+
+/*
+ * 2. 调试辅助宏
+ */
+#ifdef CONFIG_DEBUG_VM
+#define VM_BUG_ON_FOLIO(cond, folio)    \
+    do {                                 \
+        if (unlikely(cond))              \
+            folio_bug(folio, #cond);     \
+    } while (0)
+#else
+#define VM_BUG_ON_FOLIO(cond, folio)    \
+    BUILD_BUG_ON_INVALID(cond)
+#endif
+
+/*
+ * 3. 遍历宏
+ */
+/* 遍历folio中的所有page */
+#define folio_for_each_page(folio, page, i)             \
+    for ((i) = 0, (page) = &(folio)->page;              \
+         (i) < folio_nr_pages(folio);                   \
+         (i)++, (page)++)
+
+/*
+ * 4. 类型检查宏
+ */
+/* 编译时确保类型正确 */
+#define folio_page(folio, n) ({                         \
+    struct folio *_f = (folio);                         \
+    VM_BUG_ON_FOLIO((n) >= folio_nr_pages(_f), _f);    \
+    &_f->page + (n);                                    \
+})
+\end{lstlisting}
+
+\texttt{FOLIO\_FLAG}是个代码生成器。给它标志位名称和页索引，它一口气帮你生成\texttt{folio\_test\_xxx}、\texttt{folio\_set\_xxx}和\texttt{folio\_clear\_xxx}三个函数。\texttt{FOLIO\_FLAG(locked, 0)}就把锁相关的三个操作全生成了。好处是什么？所有标志位操作的行为模式完全一致，没有手写代码带来的不一致和遗漏风险。
+
+\texttt{VM\_BUG\_ON\_FOLIO}在调试模式下做条件检查，出了问题调\texttt{folio\_bug}；非调试模式下用\texttt{BUILD\_BUG\_ON\_INVALID}保证表达式语法合法但不产生运行时代码——巧妙的做法。\texttt{folio\_for\_each\_page}封装了遍历folio中所有page的循环模式。\texttt{folio\_page}宏在调试模式下会验证索引n不越界，防止你访问folio范围之外的page。
+
+\section{渐进式迁移策略}
+
+\subsection{迁移的必要性}
+
+folio的引入面临一个巨大的挑战：内核中有成千上万处使用\texttt{struct page}的代码，不可能一次性全部迁移。因此，Wilcox采用了渐进式迁移策略：
+
+\begin{lstlisting}[language=C,caption={渐进式迁移的必要性},label={lst:migration-necessity}]
+/*
+ * 内核中page使用的规模
+ * 
+ * $ git grep 'struct page \*' | wc -l
+ * 约15000+处使用
+ * 
+ * $ git grep 'page->' | wc -l
+ * 约25000+处引用
+ * 
+ * 这么大规模的代码不可能一次性重写
+ */
+
+/*
+ * 渐进式迁移允许：
+ * 1. 新代码使用folio
+ * 2. 旧代码继续使用page
+ * 3. 两套API可以共存
+ * 4. 随着时间推移逐步迁移
+ */
+\end{lstlisting}
+
+数字说明一切：15000多处\texttt{struct page *}声明，25000多处\texttt{page->}成员访问。谁要是想一次性把这些全改成folio，那就是在做梦——别说工程量，光是测试就不可能在一个合并窗口里完成。所以只能渐进式来：新代码用folio API写，旧代码继续用page API，两套通过兼容层共存，各个子系统慢慢迁移。
+
+\subsection{迁移的阶段}
+
+folio的迁移分为几个阶段进行：
+
+\begin{lstlisting}[language=C,caption={folio迁移阶段},label={lst:migration-phases}]
+/*
+ * 阶段1：基础设施（Linux 5.16）
+ * - 定义struct folio
+ * - 实现基本的转换函数
+ * - 添加folio_xxx()基础API
+ */
+struct folio {
+    /* ... */
+};
+
+static inline struct folio *page_folio(struct page *page);
+void folio_get(struct folio *folio);
+void folio_put(struct folio *folio);
+
+/*
+ * 阶段2：页缓存迁移（Linux 5.17-5.18）
+ * - 文件系统的页缓存代码迁移到folio
+ * - filemap层的核心函数改用folio
+ */
+struct folio *filemap_get_folio(struct address_space *mapping,
+                                 pgoff_t index);
+int filemap_add_folio(struct address_space *mapping,
+                      struct folio *folio, 
+                      pgoff_t index, 
+                      gfp_t gfp);
+
+/*
+ * 阶段3：内存回收迁移（Linux 5.19-6.0）
+ * - LRU列表改用folio
+ * - vmscan迁移到folio
+ */
+void folio_add_lru(struct folio *folio);
+void folio_activate(struct folio *folio);
+
+/*
+ * 阶段4：文件系统迁移（Linux 6.1+）
+ * - 各个文件系统逐步迁移
+ * - ext4, xfs, btrfs等
+ */
+/* 以ext4为例 */
+int ext4_read_folio(struct file *file, struct folio *folio);
+int ext4_write_folio(struct folio *folio, 
+                     struct writeback_control *wbc);
+
+/*
+ * 阶段5：驱动程序迁移（持续进行）
+ * - 各种驱动程序逐步采用folio
+ */
+
+/*
+ * 阶段6：清理遗留API（长期目标）
+ * - 移除不再需要的page API
+ * - 简化内部实现
+ */
+\end{lstlisting}
+
+迁移的顺序是从核心往外围推进的。5.16先把基础设施立起来：\texttt{struct folio}的定义、转换函数、基本的引用计数操作。5.17到5.18迁移页缓存核心代码，这一步最关键，因为filemap层是用page最密集的地方。5.19到6.0轮到LRU列表和vmscan，也就是内存回收子系统。
+
+6.1之后开始各个文件系统的迁移。ext4带头，\texttt{ext4\_read\_folio}和\texttt{ext4\_write\_folio}取代了原来的page版本。文件系统种类多（ext4、xfs、btrfs、f2fs等等），这一阶段需要的时间比较长。然后是驱动程序——面更广但单个改动更简单。最后的目标是清理掉所有遗留的page API。每一步都建立在前一步的基础上，不存在跳跃式的冒险。
+
+\subsection{迁移兼容层}
+
+为了支持渐进式迁移，folio提供了一套兼容层：
+
+\begin{lstlisting}[language=C,caption={迁移兼容层},label={lst:migration-compat}]
+/*
+ * 1. page函数的folio包装
+ * 允许旧代码逐步迁移
+ */
+/* 旧的page锁函数 */
+void lock_page(struct page *page)
+{
+    /* 内部已经使用folio实现 */
+    struct folio *folio = page_folio(page);
+    __folio_lock(folio);
+}
+
+/* 旧的page解锁函数 */
+void unlock_page(struct page *page)
+{
+    struct folio *folio = page_folio(page);
+    folio_unlock(folio);
+}
+
+/*
+ * 2. 双版本API
+ * 同时提供page和folio版本
+ */
+/* page版本 - 供旧代码使用 */
+static inline void set_page_dirty(struct page *page)
+{
+    struct folio *folio = page_folio(page);
+    folio_mark_dirty(folio);
+}
+
+/* folio版本 - 供新代码使用 */
+void folio_mark_dirty(struct folio *folio)
+{
+    /* 实际的dirty标记逻辑 */
+    if (!folio_test_dirty(folio)) {
+        folio_set_dirty(folio);
+        /* 通知address_space */
+        __folio_mark_dirty(folio);
+    }
+}
+
+/*
+ * 3. 自动迁移宏
+ * 帮助检测未迁移的代码
+ */
+#ifdef CONFIG_FOLIO_MIGRATION_CHECK
+/* 标记即将废弃的page函数 */
+#define DEPRECATED_PAGE_FUNCTION(func) \
+    __attribute__((deprecated("Use folio version: folio_" #func)))
+#else
+#define DEPRECATED_PAGE_FUNCTION(func)
+#endif
+
+void DEPRECATED_PAGE_FUNCTION(lock)
+lock_page(struct page *page);
+
+/*
+ * 4. 迁移辅助函数
+ */
+/* 检查代码是否已迁移到folio */
+static inline bool using_folio_api(void)
+{
+#ifdef CONFIG_FOLIO_MIGRATION_COMPLETE
+    return true;
+#else
+    return false;
+#endif
+}
+\end{lstlisting}
+
+兼容层用了四种手段。第一种最直接：\texttt{lock\_page}、\texttt{unlock\_page}这些旧函数内部转成folio后调folio版本，旧代码不用改，行为跟新实现一致。第二种是双版本API并存：\texttt{set\_page\_dirty}内部调\texttt{folio\_mark\_dirty}，真正的标记逻辑（检查是否已脏、设置脏标志、通知address\_space）只在folio版本里维护。
+
+第三种比较巧：用GCC的\texttt{deprecated}属性标记旧函数。打开\texttt{CONFIG\_FOLIO\_MIGRATION\_CHECK}后，你用\texttt{lock\_page}编译器就会警告你该换\texttt{folio\_lock}了。开发环境开着这个选项，生产环境关掉就行。第四种是\texttt{using\_folio\_api()}辅助函数，让代码可以根据迁移进度走不同的分支。
+
+\subsection{迁移检查清单}
+
+对于想要将代码迁移到folio的开发者，以下是一个检查清单：
+
+\begin{lstlisting}[language=C,caption={folio迁移检查清单},label={lst:migration-checklist}]
+/*
+ * folio迁移检查清单
+ *
+ * 1. 数据结构迁移
+ *    [ ] struct page * -> struct folio *（在适用的地方）
+ *    [ ] 保留struct page *用于真正需要单页操作的地方
+ *
+ * 2. 函数签名迁移
+ *    [ ] 函数参数从page改为folio
+ *    [ ] 更新函数名（如果约定需要）
+ *    [ ] 更新调用者
+ *
+ * 3. API调用迁移
+ *    [ ] lock_page() -> folio_lock()
+ *    [ ] unlock_page() -> folio_unlock()
+ *    [ ] get_page() -> folio_get()
+ *    [ ] put_page() -> folio_put()
+ *    [ ] PageDirty() -> folio_test_dirty()
+ *    [ ] SetPageDirty() -> folio_set_dirty()
+ *    [ ] 等等...
+ *
+ * 4. 迭代和遍历迁移
+ *    [ ] compound_head() -> 直接使用folio
+ *    [ ] for循环遍历 -> folio_for_each_page()
+ *
+ * 5. 测试和验证
+ *    [ ] 运行相关测试套件
+ *    [ ] 检查性能回归
+ *    [ ] 使用sparse进行静态检查
+ */
+
+/* 
+ * 迁移示例：从page到folio
+ */
+/* 迁移前 */
+int old_read_page(struct file *file, struct page *page)
+{
+    struct page *head = compound_head(page);
+    
+    lock_page(head);
+    /* 读取逻辑... */
+    SetPageUptodate(head);
+    unlock_page(head);
+    
+    return 0;
+}
+
+/* 迁移后 */
+int new_read_folio(struct file *file, struct folio *folio)
+{
+    folio_lock(folio);
+    /* 读取逻辑... */
+    folio_mark_uptodate(folio);
+    folio_unlock(folio);
+    
+    return 0;
+}
+\end{lstlisting}
+
+这个检查清单覆盖了迁移的五个方面：数据结构、函数签名、API调用、迭代遍历、测试验证。如果你要迁移自己维护的子系统，照着这个清单走就不容易漏。
+
+对比迁移前后的代码就能看出效果。\texttt{old\_read\_page}里先\texttt{compound\_head}拿头页，然后\texttt{lock\_page}、\texttt{SetPageUptodate}、\texttt{unlock\_page}——三个函数三种命名风格。\texttt{new\_read\_folio}呢？\texttt{folio\_lock}、\texttt{folio\_mark\_uptodate}、\texttt{folio\_unlock}，命名一致，而且\texttt{compound\_head}不见了。为什么不需要了？因为folio类型本身就保证你操作的是正确的内存单元。
+
+\section{与其他内核改进的协同}
+
+\subsection{与XArray的协同}
+
+XArray是Linux内核中的一个新数据结构，用于替代radix tree。folio与XArray的结合是一个协同设计的典范：
+
+\begin{lstlisting}[language=C,caption={folio与XArray的协同},label={lst:folio-xarray}]
+/*
+ * 页缓存使用XArray存储folio
+ * 
+ * struct address_space {
+ *     ...
+ *     struct xarray i_pages;  // 存储folio的XArray
+ *     ...
+ * };
+ */
+
+/*
+ * 在XArray中查找folio
+ */
+struct folio *filemap_get_folio(struct address_space *mapping,
+                                 pgoff_t index)
+{
+    XA_STATE(xas, &mapping->i_pages, index);
+    struct folio *folio;
+    
+    rcu_read_lock();
+repeat:
+    /*
+     * XArray可以高效地存储多种大小的folio
+     * - 单页folio占用一个slot
+     * - 大folio占用多个slot
+     */
+    folio = xas_load(&xas);
+    if (!folio || xas_retry(&xas, folio))
+        goto repeat;
+    
+    /* 
+     * XArray的RCU保护与folio的引用计数配合
+     * 确保在读取期间folio不会被释放
+     */
+    if (!folio_try_get_rcu(folio))
+        goto repeat;
+    
+    if (unlikely(folio != xas_reload(&xas))) {
+        folio_put(folio);
+        goto repeat;
+    }
+    
+    rcu_read_unlock();
+    return folio;
+}
+
+/*
+ * 在XArray中插入folio
+ */
+int filemap_add_folio(struct address_space *mapping,
+                      struct folio *folio, 
+                      pgoff_t index, 
+                      gfp_t gfp)
+{
+    XA_STATE(xas, &mapping->i_pages, index);
+    unsigned int order = folio_order(folio);
+    unsigned long nr = folio_nr_pages(folio);
+    int error;
+    
+    folio->mapping = mapping;
+    folio->index = index;
+    
+    /*
+     * 大folio需要在XArray中占用多个位置
+     * xas_set_order()告诉XArray这是一个大条目
+     */
+    do {
+        xas_lock_irq(&xas);
+        xas_set_order(&xas, index, order);
+        
+        /* XArray确保整个范围可用 */
+        xas_store(&xas, folio);
+        
+        if (xas_error(&xas))
+            goto unlock;
+        
+        /* 更新统计 */
+        mapping->nrpages += nr;
+        
+unlock:
+        xas_unlock_irq(&xas);
+    } while (xas_nomem(&xas, gfp));
+    
+    return xas_error(&xas);
+}
+
+/*
+ * XArray和folio协同的好处：
+ * 1. 自然地支持大folio
+ * 2. RCU保护机制一致
+ * 3. 内存效率高
+ * 4. 查找和遍历高效
+ */
+\end{lstlisting}
+
+\texttt{filemap\_get\_folio}的查找逻辑值得仔细看。\texttt{XA\_STATE}初始化XArray遍历状态，然后在RCU读保护下\texttt{xas\_load}加载folio。并发场景下事情没那么简单：\texttt{xas\_retry}检查XArray的内部重试标记，\texttt{folio\_try\_get\_rcu}尝试在RCU保护下拿引用计数（folio正在被释放就会失败），\texttt{xas\_reload}重新加载条目确认folio没被换掉。任何一步失败都goto repeat。
+
+\texttt{filemap\_add\_folio}的插入过程也有讲究。设置好folio的\texttt{mapping}和\texttt{index}之后，在\texttt{xas\_lock\_irq}保护下用\texttt{xas\_set\_order}告诉XArray这个条目的阶数——大folio需要占多个连续slot。然后\texttt{xas\_store}存入folio指针。注意外层的\texttt{do...while(xas\_nomem)}循环：XArray插入时可能要分配内部节点，分配失败了\texttt{xas\_nomem}会用指定的GFP标志重新分配并重试。XArray天然支持不同大小的条目，跟folio配合起来，页缓存不需要任何额外的数据结构适配就能存储各种大小的folio。
+
+\subsection{与内存控制组（memcg）的协同}
+
+folio与memcg的集成简化了内存记账：
+
+\begin{lstlisting}[language=C,caption={folio与memcg的协同},label={lst:folio-memcg}]
+/*
+ * folio简化了memcg记账
+ * 
+ * 旧方式：需要处理复合页的特殊情况
+ * 新方式：folio提供了统一的接口
+ */
+
+/*
+ * folio结构中的memcg字段
+ */
+struct folio {
+    /* ... */
+#ifdef CONFIG_MEMCG
+    unsigned long memcg_data;  /* memcg相关数据 */
+#endif
+    /* ... */
+};
+
+/*
+ * 为folio记账
+ */
+int folio_memcg_charge(struct folio *folio, struct mm_struct *mm,
+                        gfp_t gfp)
+{
+    struct mem_cgroup *memcg;
+    long nr_pages = folio_nr_pages(folio);
+    
+    /*
+     * folio_nr_pages()直接返回页数
+     * 不需要检查是否是复合页
+     */
+    memcg = get_mem_cgroup_from_mm(mm);
+    
+    /* 记账整个folio的内存 */
+    if (mem_cgroup_charge(memcg, folio, nr_pages, gfp)) {
+        mem_cgroup_put(memcg);
+        return -ENOMEM;
+    }
+    
+    /* 关联folio和memcg */
+    folio_set_memcg(folio, memcg);
+    
+    return 0;
+}
+
+/*
+ * 取消folio的记账
+ */
+void folio_memcg_uncharge(struct folio *folio)
+{
+    struct mem_cgroup *memcg = folio_memcg(folio);
+    long nr_pages = folio_nr_pages(folio);
+    
+    if (!memcg)
+        return;
+    
+    /* 减少memcg的使用计数 */
+    mem_cgroup_uncharge(memcg, nr_pages);
+    
+    /* 清除关联 */
+    folio_clear_memcg(folio);
+    mem_cgroup_put(memcg);
+}
+
+/*
+ * 好处：
+ * 1. 简化了复合页的记账逻辑
+ * 2. folio_nr_pages()消除了条件判断
+ * 3. 记账和folio生命周期自然对齐
+ */
+\end{lstlisting}
+
+memcg记账的核心就是``分配时扣、释放时还''。\texttt{folio\_memcg\_charge}通过\texttt{folio\_nr\_pages}拿到页数——不管是单页还是大folio，一个调用搞定，不需要先判断是不是复合页。然后从进程所属的memcg里扣配额，配额不够就返回\texttt{-ENOMEM}，够了就用\texttt{folio\_set\_memcg}把folio和memcg关联起来。
+
+\texttt{folio\_memcg\_uncharge}是反向操作：拿到关联的memcg，算页数，还配额，清关联，释放memcg引用。跟旧的page-based记账比，最大的改善在于消除了复合页的特殊处理。单页folio也好，大folio也好，记账流程完全一样。\texttt{folio\_nr\_pages()}帮你屏蔽了这些差异。
+
+\subsection{与透明大页（THP）的协同}
+
+folio为透明大页提供了更自然的抽象：
+
+\begin{lstlisting}[language=C,caption={folio与THP的协同},label={lst:folio-thp}]
+/*
+ * THP的folio表示
+ * 
+ * 传统上，THP使用复合页表示
+ * folio使这变得更加清晰
+ */
+
+/*
+ * 分配THP folio
+ */
+struct folio *alloc_thp_folio(gfp_t gfp)
+{
+    struct folio *folio;
+    
+    /*
+     * THP是order-9的folio（2MB on x86）
+     * folio_alloc()自然支持大阶分配
+     */
+    folio = folio_alloc(gfp | __GFP_COMP, HPAGE_PMD_ORDER);
+    if (!folio)
+        return NULL;
+    
+    /*
+     * 设置THP标志
+     */
+    folio_set_large_rmappable(folio);
+    
+    return folio;
+}
+
+/*
+ * 检查folio是否是THP
+ */
+static inline bool folio_is_thp(struct folio *folio)
+{
+    /*
+     * THP是大folio
+     * 使用folio_test_large()检查
+     */
+    return folio_test_large(folio) && 
+           folio_order(folio) == HPAGE_PMD_ORDER;
+}
+
+/*
+ * THP分裂
+ * 将一个大folio分裂成多个小folio
+ */
+int split_folio(struct folio *folio)
+{
+    unsigned int order = folio_order(folio);
+    unsigned long nr = folio_nr_pages(folio);
+    int i;
+    
+    if (!folio_test_large(folio))
+        return 0;  /* 已经是小folio */
+    
+    folio_lock(folio);
+    
+    /*
+     * 分裂逻辑：
+     * 1. 复制元数据到尾页
+     * 2. 更新引用计数
+     * 3. 清除复合页标志
+     */
+    for (i = 1; i < nr; i++) {
+        struct page *page = folio_page(folio, i);
+        /* 初始化为独立页 */
+        prep_new_page(page, 0, gfp);
+    }
+    
+    /* 更新头页 */
+    folio_clear_large(folio);
+    
+    folio_unlock(folio);
+    
+    return 0;
+}
+
+/*
+ * folio对THP的优势：
+ * 1. 类型清晰：THP就是一个大folio
+ * 2. 分裂逻辑简化：folio_nr_pages()直接可用
+ * 3. 合并逻辑简化：多个小folio合并为一个大folio
+ * 4. 统计更准确：基于folio而非page计数
+ */
+\end{lstlisting}
+
+THP在folio的世界里就是个阶数为\texttt{HPAGE\_PMD\_ORDER}的大folio，x86上就是order-9，对应2MB。\texttt{alloc\_thp\_folio}里的\texttt{\_\_GFP\_COMP}标志告诉分配器创建复合页结构，\texttt{folio\_set\_large\_rmappable}让这个folio能被反向映射机制跟踪。
+
+\texttt{folio\_is\_thp}的判断逻辑很直白：是大folio并且阶数等于\texttt{HPAGE\_PMD\_ORDER}。\texttt{split\_folio}做的是大folio分裂。为什么要分裂？内存压力大的时候，你可能只需要回收大folio中的部分页面。分裂过程在锁保护下进行：遍历所有尾页，把每个初始化为独立page，最后清除头页的大folio标志。注意，folio让THP的表达变得自然了——不需要额外的类型或数据结构，一个大folio就够了。
+
+\subsection{与页表管理的协同}
+
+folio与页表管理的集成：
+
+\begin{lstlisting}[language=C,caption={folio与页表的协同},label={lst:folio-pagetable}]
+/*
+ * 建立folio的页表映射
+ */
+int folio_map_range(struct vm_area_struct *vma,
+                    struct folio *folio,
+                    unsigned long addr)
+{
+    unsigned long nr = folio_nr_pages(folio);
+    pgoff_t offset;
+    int i;
+    pte_t *pte;
+    
+    /*
+     * 为folio的每一页建立PTE
+     */
+    for (i = 0; i < nr; i++) {
+        struct page *page = folio_page(folio, i);
+        
+        pte = get_pte(vma->vm_mm, addr + i * PAGE_SIZE);
+        if (!pte)
+            return -ENOMEM;
+        
+        /*
+         * 设置PTE
+         * 所有页指向同一个folio
+         */
+        set_pte(pte, mk_pte(page, vma->vm_page_prot));
+    }
+    
+    /*
+     * 更新folio的mapcount
+     * 一次映射多个页只增加一次计数
+     */
+    folio_add_anon_rmap(folio, vma, addr);
+    
+    return 0;
+}
+
+/*
+ * 解除folio的映射
+ */
+void folio_unmap(struct folio *folio, struct vm_area_struct *vma,
+                 unsigned long addr)
+{
+    unsigned long nr = folio_nr_pages(folio);
+    int i;
+    
+    for (i = 0; i < nr; i++) {
+        pte_t *pte = get_pte(vma->vm_mm, addr + i * PAGE_SIZE);
+        if (pte)
+            pte_clear(vma->vm_mm, addr + i * PAGE_SIZE, pte);
+    }
+    
+    /*
+     * 减少mapcount
+     */
+    folio_remove_anon_rmap(folio, vma);
+}
+
+/*
+ * PMD映射（用于大folio）
+ */
+int folio_map_pmd(struct vm_area_struct *vma,
+                  struct folio *folio,
+                  unsigned long addr)
+{
+    pmd_t *pmd;
+    
+    /*
+     * 大folio可以使用PMD映射
+     * 一个PMD项映射整个folio
+     */
+    if (folio_order(folio) < HPAGE_PMD_ORDER)
+        return -EINVAL;
+    
+    pmd = get_pmd(vma->vm_mm, addr);
+    if (!pmd)
+        return -ENOMEM;
+    
+    /*
+     * 设置PMD
+     * 一次映射整个2MB区域
+     */
+    set_pmd(pmd, mk_pmd(folio_page(folio, 0), vma->vm_page_prot));
+    
+    folio_add_anon_rmap(folio, vma, addr);
+    
+    return 0;
+}
+\end{lstlisting}
+
+\texttt{folio\_map\_range}为folio的每一页建立PTE映射。循环里对每个页调\texttt{get\_pte}拿PTE指针，\texttt{set\_pte}设置映射。注意一个细节：映射了多个页，但\texttt{folio\_add\_anon\_rmap}只调一次——反向映射把整个folio当作一个单元，不是按单页计数的。
+
+\texttt{folio\_unmap}做反向操作，遍历清除PTE，减少反向映射计数。但真正有意思的是\texttt{folio\_map\_pmd}：如果folio够大（阶数达到\texttt{HPAGE\_PMD\_ORDER}，通常是2MB），就用一个PMD条目映射整个folio，而不是512个独立的PTE。页表项从512个变成1个，TLB压力也大幅降低。这种PTE和PMD双路径的映射机制，是folio在大页场景下的重要优势。
+
+\section{设计权衡和取舍}
+
+\subsection{类型安全vs运行时开销}
+
+folio的类型安全设计带来了编译时检查的好处，但也有一些权衡：
+
+\begin{lstlisting}[language=C,caption={类型安全的权衡},label={lst:type-safety-tradeoff}]
+/*
+ * 权衡1：转换函数的开销
+ * 
+ * page_folio()需要检查compound_head
+ * 在某些情况下这是额外的开销
+ */
+static inline struct folio *page_folio(struct page *page)
+{
+    unsigned long head = READ_ONCE(page->compound_head);
+    
+    /* 这个检查在热路径中可能是额外开销 */
+    if (unlikely(head & 1))
+        return (struct folio *)(head - 1);
+    return (struct folio *)page;
+}
+
+/*
+ * 解决方案：在已知是头页的情况下使用直接转换
+ */
+/* 当我们确定page是folio的第一页时 */
+#define page_to_folio_unsafe(page) ((struct folio *)(page))
+
+/*
+ * 权衡2：API复杂性增加
+ * 
+ * 现在需要两套API：page和folio
+ * 开发者需要知道何时使用哪一套
+ */
+
+/*
+ * 指导原则：
+ * - 新代码优先使用folio API
+ * - 真正需要单页操作时使用page API
+ * - 性能关键路径可以使用不安全的转换
+ */
+
+/*
+ * 权衡3：结构体大小
+ * 
+ * folio并不比page大，因为它复用了page的内存
+ * 但大folio需要额外的元数据空间
+ */
+struct folio {
+    /* 第一个page槽位 */
+    struct {
+        unsigned long flags;
+        /* ... */
+    };
+    
+    /* 第二个page槽位（大folio使用） */
+    union {
+        struct {
+            /* 大folio的额外元数据 */
+            unsigned long _flags_1;
+            unsigned long _head_1;
+            unsigned char _folio_dtor;
+            unsigned char _folio_order;
+            atomic_t _total_mapcount;
+            atomic_t _pincount;
+            /* ... */
+        };
+        struct page __page_1;  /* 占位，确保大小正确 */
+    };
+};
+
+/*
+ * 这意味着大folio的前两个page槽位被用于元数据
+ * 而不是实际的page数据
+ */
+\end{lstlisting}
+
+天下没有免费的午餐。\texttt{page\_folio()}每次都要读\texttt{compound\_head}并检查最低位，在热路径中这就是额外开销。所以有了\texttt{page\_to\_folio\_unsafe}这种不做检查的直接转换宏——你确定手里是头页时可以用，但风险自负。另一个权衡是API复杂性：现在两套API并存，开发者需要知道什么时候用哪套。原则很简单：新代码用folio，真正只操作单页的地方用page。
+
+结构体大小呢？folio本身并不比page大，因为它复用了page的内存。但大folio的第二个page槽位被拿去存元数据了：\texttt{\_folio\_dtor}、\texttt{\_folio\_order}、\texttt{\_total\_mapcount}、\texttt{\_pincount}这些字段。也就是说大folio的前两个page槽位（128字节）是元数据而不是实际数据。不过算一笔账：order-9的THP有512个page，元数据占了2个，不到0.4\%。完全可以接受。
+
+\subsection{渐进式迁移vs代码复杂度}
+
+渐进式迁移策略带来了兼容性，但也增加了复杂度：
+
+\begin{lstlisting}[language=C,caption={迁移策略的权衡},label={lst:migration-tradeoff}]
+/*
+ * 权衡1：双API的维护成本
+ * 
+ * 在迁移期间，内核需要同时维护两套API
+ * 这增加了代码量和维护负担
+ */
+
+/* page版本 */
+void lock_page(struct page *page)
+{
+    struct folio *folio = page_folio(page);
+    __folio_lock(folio);
+}
+
+/* folio版本 */
+void folio_lock(struct folio *folio)
+{
+    __folio_lock(folio);
+}
+
+/*
+ * 权衡2：行为一致性
+ * 
+ * 在迁移过程中，某些代码使用page，某些使用folio
+ * 需要确保行为一致
+ */
+
+/*
+ * 权衡3：迁移时间线
+ * 
+ * 渐进式迁移需要数年时间
+ * 在此期间，代码处于混合状态
+ */
+
+/*
+ * 解决方案：明确的迁移路线图
+ * 
+ * 阶段1：基础设施（已完成）
+ * 阶段2：核心代码迁移（进行中）
+ * 阶段3：驱动和文件系统迁移（长期）
+ * 阶段4：清理旧API（未来）
+ */
+\end{lstlisting}
+
+渐进式迁移的代价是显而易见的。\texttt{lock\_page}和\texttt{folio\_lock}同时存在，前者就是后者的壳——冗余是冗余了，但旧代码不用改。混合使用的时候还得保证两套API对同一块内存的操作结果一致，兼容层的设计不能有一丝马虎。
+
+时间线也是个问题。这种迁移要跨好几个内核版本，可能持续数年，代码一直处于混合状态。应对方法是把路线图定清楚：基础设施（已完成）、核心代码迁移（进行中）、文件系统和驱动迁移（长期）、清理旧API（未来）。每完成一个阶段就是一个稳定状态，不会因为迁移到一半就留下系统性的坑。
+
+\subsection{通用性vs特化性}
+
+folio设计在通用性和特化性之间做了平衡：
+
+\begin{lstlisting}[language=C,caption={通用性vs特化性},label={lst:generality-tradeoff}]
+/*
+ * 通用设计：folio适用于所有内存用途
+ * 
+ * - 页缓存
+ * - 匿名页
+ * - slab分配
+ * - 等等
+ */
+
+/*
+ * 但某些场景可能需要特化处理
+ */
+
+/*
+ * 例1：slab分配器
+ * 
+ * slab有自己的元数据需求
+ * folio需要为slab提供特殊字段
+ */
+struct folio {
+    /* ... */
+    struct {
+        /* slab特有字段 */
+        struct list_head slab_list;
+        struct kmem_cache *slab_cache;
+        void *freelist;
+        /* ... */
+    };
+    /* ... */
+};
+
+/*
+ * 例2：网络页
+ * 
+ * 网络栈对页有特殊需求
+ * 需要考虑DMA对齐等
+ */
+
+/*
+ * 解决方案：使用union来复用空间
+ * 不同用途使用不同的字段集
+ */
+struct folio {
+    union {
+        /* 页缓存使用 */
+        struct {
+            struct address_space *mapping;
+            pgoff_t index;
+            void *private;
+        };
+        
+        /* 匿名页使用 */
+        struct {
+            struct anon_vma *anon_vma;
+            /* ... */
+        };
+        
+        /* slab使用 */
+        struct {
+            struct kmem_cache *slab_cache;
+            void *freelist;
+            /* ... */
+        };
+    };
+};
+\end{lstlisting}
+
+folio想要通吃所有内存用途：页缓存、匿名页、slab分配。但这些场景的元数据需求完全不同——页缓存要\texttt{mapping}和\texttt{index}，匿名页要\texttt{anon\_vma}，slab要\texttt{slab\_cache}和\texttt{freelist}。怎么在一个结构体里塞下这些东西又不把它撑大？
+
+答案是union。一个folio在任何时刻只会用于一种用途，所以这些字段不会同时用到，放在union里共享同一块内存完全安全。结构体大小没变，各个子系统的特化需求也满足了。这是C语言里实现``零成本多态''的经典手法。
+
+\subsection{性能vs安全性}
+
+在某些情况下，folio需要在性能和安全性之间做权衡：
+
+\begin{lstlisting}[language=C,caption={性能vs安全性},label={lst:performance-safety}]
+/*
+ * 安全版本：始终检查
+ */
+static inline struct folio *page_folio(struct page *page)
+{
+    unsigned long head = READ_ONCE(page->compound_head);
+    
+    /* 检查是否是尾页 */
+    if (unlikely(head & 1))
+        return (struct folio *)(head - 1);
+    
+    return (struct folio *)page;
+}
+
+/*
+ * 性能版本：假设已经是头页
+ * 用于已知条件的快速路径
+ */
+static __always_inline struct folio *
+page_folio_assume_head(struct page *page)
+{
+    VM_BUG_ON_PAGE(page_is_tail(page), page);
+    return (struct folio *)page;
+}
+
+/*
+ * 使用场景
+ */
+void hot_path_function(struct page *known_head)
+{
+    /* 这里我们知道是头页，使用快速版本 */
+    struct folio *folio = page_folio_assume_head(known_head);
+    /* ... */
+}
+
+void general_function(struct page *unknown)
+{
+    /* 不确定是否是头页，使用安全版本 */
+    struct folio *folio = page_folio(unknown);
+    /* ... */
+}
+
+/*
+ * 编译时配置
+ * DEBUG模式使用安全版本
+ * RELEASE模式可以使用快速版本
+ */
+#ifdef CONFIG_DEBUG_VM
+#define FOLIO_DEBUG_CHECK 1
+#else
+#define FOLIO_DEBUG_CHECK 0
+#endif
+
+static inline struct folio *conditional_page_folio(struct page *page)
+{
+    if (FOLIO_DEBUG_CHECK)
+        return page_folio(page);
+    else
+        return page_folio_assume_head(page);
+}
+\end{lstlisting}
+
+安全版本\texttt{page\_folio}每次都检查\texttt{compound\_head}，不确定page类型时用它没错。性能版本\texttt{page\_folio\_assume\_head}跳过检查，只在调试模式下用\texttt{VM\_BUG\_ON\_PAGE}做断言。你确定是头页就用这个，快。
+
+\texttt{conditional\_page\_folio}把选择权交给编译配置：\texttt{CONFIG\_DEBUG\_VM}开着就走安全路径，关了就走快速路径。\texttt{FOLIO\_DEBUG\_CHECK}是编译时常量，编译器直接把另一个分支优化掉了，运行时没有条件判断的开销。调试时查错，上线时跑快——内核里到处都是这种套路。
+
+\section{代码示例展示设计思想}
+
+\subsection{完整的folio操作流程}
+
+以下示例展示了folio设计思想在实际代码中的体现：
+
+\begin{lstlisting}[language=C,caption={folio操作的完整示例},label={lst:folio-complete-example}]
+/**
+ * 示例：从文件读取数据到用户空间
+ * 
+ * 这个例子展示了folio API的设计思想：
+ * 1. 类型安全
+ * 2. 清晰的所有权语义
+ * 3. 一致的命名
+ */
+
+ssize_t folio_read_example(struct file *file, char __user *buf,
+                           size_t count, loff_t *pos)
+{
+    struct address_space *mapping = file->f_mapping;
+    struct folio *folio;
+    pgoff_t index = *pos >> PAGE_SHIFT;
+    size_t offset = *pos & (PAGE_SIZE - 1);
+    size_t copied = 0;
+    int error;
+    
+    /*
+     * 设计思想1：函数名清楚表达意图
+     * filemap_get_folio() 明确表示从文件映射获取folio
+     */
+    folio = filemap_get_folio(mapping, index);
+    if (IS_ERR(folio)) {
+        /*
+         * folio不存在，需要分配并读取
+         */
+        folio = filemap_alloc_folio(mapping_gfp_mask(mapping), 0);
+        if (!folio)
+            return -ENOMEM;
+        
+        /*
+         * 设计思想2：所有权语义清晰
+         * folio_alloc返回的folio引用计数为1
+         * 我们"拥有"这个folio
+         */
+        
+        /* 加入页缓存 */
+        error = filemap_add_folio(mapping, folio, index,
+                                   mapping_gfp_mask(mapping));
+        if (error) {
+            folio_put(folio);  /* 失败，释放我们的引用 */
+            return error;
+        }
+    }
+    
+    /*
+     * 设计思想3：锁定语义清晰
+     * folio_lock()清楚地表示锁定整个folio
+     */
+    folio_lock(folio);
+    
+    /*
+     * 检查folio是否已经有数据
+     */
+    if (!folio_test_uptodate(folio)) {
+        /*
+         * 需要从磁盘读取
+         * 设计思想4：标志位操作命名一致
+         * folio_test_xxx() / folio_set_xxx() / folio_clear_xxx()
+         */
+        error = folio_read_from_disk(folio, mapping, index);
+        if (error) {
+            folio_unlock(folio);
+            folio_put(folio);
+            return error;
+        }
+        
+        /*
+         * 标记数据已就绪
+         */
+        folio_mark_uptodate(folio);
+    }
+    
+    /*
+     * 复制数据到用户空间
+     * 设计思想5：folio_address()返回统一的地址
+     * 不需要担心是单页还是复合页
+     */
+    void *kaddr = folio_address(folio);
+    size_t len = min(count, folio_size(folio) - offset);
+    
+    if (copy_to_user(buf, kaddr + offset, len)) {
+        folio_unlock(folio);
+        folio_put(folio);
+        return -EFAULT;
+    }
+    
+    copied = len;
+    
+    /*
+     * 更新访问时间等统计
+     */
+    folio_mark_accessed(folio);
+    
+    /*
+     * 设计思想6：配对的lock/unlock
+     */
+    folio_unlock(folio);
+    
+    /*
+     * 设计思想7：配对的get/put
+     * filemap_get_folio增加了引用，现在需要减少
+     */
+    folio_put(folio);
+    
+    *pos += copied;
+    return copied;
+}
+
+/*
+ * 辅助函数：从磁盘读取folio
+ */
+static int folio_read_from_disk(struct folio *folio,
+                                 struct address_space *mapping,
+                                 pgoff_t index)
+{
+    struct inode *inode = mapping->host;
+    struct bio *bio;
+    sector_t block;
+    
+    /*
+     * 计算块位置
+     */
+    block = index << (PAGE_SHIFT - inode->i_blkbits);
+    
+    /*
+     * 构建bio请求
+     * 设计思想8：folio_nr_pages()简化了大小计算
+     */
+    bio = bio_alloc(GFP_KERNEL, folio_nr_pages(folio));
+    
+    bio->bi_iter.bi_sector = block * (PAGE_SIZE >> 9);
+    bio->bi_bdev = inode->i_sb->s_bdev;
+    bio->bi_end_io = folio_end_io;
+    bio->bi_private = folio;
+    
+    /*
+     * 添加folio的所有页到bio
+     */
+    bio_add_folio(bio, folio, folio_size(folio), 0);
+    
+    /*
+     * 提交IO请求
+     */
+    submit_bio(REQ_OP_READ, bio);
+    
+    /*
+     * 等待IO完成
+     */
+    folio_wait_locked(folio);
+    
+    return folio_test_uptodate(folio) ? 0 : -EIO;
+}
+\end{lstlisting}
+
+这个示例走了一遍从文件读取数据到用户空间的完整流程，我们来跟着走一遍。先用\texttt{filemap\_get\_folio}在页缓存里找folio，没找到就\texttt{filemap\_alloc\_folio}分配一个，\texttt{filemap\_add\_folio}加入页缓存。拿到folio之后\texttt{folio\_lock}加锁，\texttt{folio\_test\_uptodate}看数据是否就绪，没就绪就从磁盘读取并\texttt{folio\_mark\_uptodate}标记。然后\texttt{folio\_address}拿虚拟地址，\texttt{copy\_to\_user}复制到用户空间。
+
+辅助函数\texttt{folio\_read\_from\_disk}是folio跟块I/O层配合的例子。构建bio时用\texttt{folio\_nr\_pages}算页数，\texttt{bio\_add\_folio}把整个folio一次性加到bio里——不用逐页添加。注意看资源管理的配对关系：\texttt{filemap\_get\_folio}拿到引用，\texttt{folio\_put}释放；\texttt{folio\_lock}加锁，\texttt{folio\_unlock}解锁。每条错误路径上都确保了资源被正确释放。folio API的命名一致性在这里帮了大忙——你不太可能忘记配对，因为名字就是对着来的。
+
+\subsection{folio批量操作示例}
+
+\begin{lstlisting}[language=C,caption={folio批量操作示例},label={lst:folio-batch-example}]
+/**
+ * 示例：批量处理folio
+ * 
+ * 展示folio在批量操作中的设计优势
+ */
+
+#define FOLIO_BATCH_SIZE 16
+
+struct folio_batch {
+    unsigned int nr;
+    struct folio *folios[FOLIO_BATCH_SIZE];
+};
+
+static inline void folio_batch_init(struct folio_batch *fbatch)
+{
+    fbatch->nr = 0;
+}
+
+static inline unsigned int folio_batch_count(struct folio_batch *fbatch)
+{
+    return fbatch->nr;
+}
+
+static inline unsigned int folio_batch_add(struct folio_batch *fbatch,
+                                            struct folio *folio)
+{
+    /*
+     * 设计思想：folio批量操作统一处理不同大小
+     * 每个folio可能包含不同数量的页
+     * 但批量操作接口保持一致
+     */
+    fbatch->folios[fbatch->nr++] = folio;
+    return fbatch->nr;
+}
+
+/**
+ * 批量标记folio为脏
+ */
+void folio_batch_mark_dirty(struct folio_batch *fbatch)
+{
+    int i;
+    
+    /*
+     * 设计思想：统一操作，无需关心folio大小
+     */
+    for (i = 0; i < fbatch->nr; i++) {
+        struct folio *folio = fbatch->folios[i];
+        folio_mark_dirty(folio);
+    }
+}
+
+/**
+ * 批量释放folio
+ */
+void folio_batch_release(struct folio_batch *fbatch)
+{
+    int i;
+    
+    for (i = 0; i < fbatch->nr; i++) {
+        struct folio *folio = fbatch->folios[i];
+        
+        /*
+         * 统计：计算释放的总页数
+         * folio_nr_pages()自动处理大小差异
+         */
+        unsigned long nr_pages = folio_nr_pages(folio);
+        
+        /* 减少引用 */
+        folio_put(folio);
+    }
+    
+    folio_batch_init(fbatch);
+}
+
+/**
+ * 实际使用示例：readahead
+ */
+void folio_readahead_example(struct address_space *mapping,
+                              pgoff_t start, unsigned int nr_pages)
+{
+    struct folio_batch fbatch;
+    pgoff_t index;
+    
+    folio_batch_init(&fbatch);
+    
+    for (index = start; index < start + nr_pages; ) {
+        struct folio *folio;
+        
+        /*
+         * 分配folio
+         * 可以尝试分配大folio以提高效率
+         */
+        folio = filemap_alloc_folio(
+            mapping_gfp_mask(mapping) | __GFP_NORETRY,
+            min(order_base_2(nr_pages - (index - start)), MAX_ORDER));
+        
+        if (!folio) {
+            /* 大folio分配失败，尝试小folio */
+            folio = filemap_alloc_folio(mapping_gfp_mask(mapping), 0);
+            if (!folio)
+                break;
+        }
+        
+        /*
+         * 加入页缓存
+         */
+        if (filemap_add_folio(mapping, folio, index,
+                               mapping_gfp_mask(mapping))) {
+            folio_put(folio);
+            continue;
+        }
+        
+        /*
+         * 加入批量
+         */
+        if (folio_batch_add(&fbatch, folio) == FOLIO_BATCH_SIZE) {
+            /* 批量已满，提交IO */
+            submit_folio_batch_read(&fbatch, mapping);
+            folio_batch_release(&fbatch);
+        }
+        
+        /*
+         * 更新索引
+         * folio_nr_pages()返回实际分配的页数
+         */
+        index += folio_nr_pages(folio);
+    }
+    
+    /* 处理剩余的folio */
+    if (folio_batch_count(&fbatch) > 0) {
+        submit_folio_batch_read(&fbatch, mapping);
+        folio_batch_release(&fbatch);
+    }
+}
+\end{lstlisting}
+
+\texttt{folio\_batch}很简单：一个计数器加一个16元素的folio指针数组。批量操作的精髓在于不关心folio的大小——批量里的每个folio可能包含不同数量的页，但接口只管folio指针。\texttt{folio\_batch\_mark\_dirty}和\texttt{folio\_batch\_release}就是遍历数组对每个folio做同样的操作。
+
+\texttt{folio\_readahead\_example}是个实际的应用场景。它为预读范围分配folio，优先尝试分配大folio（加上\texttt{\_\_GFP\_NORETRY}避免过多重试），失败就退回到单页folio。分配好的folio加入页缓存并收集到批量中，批量满了就提交一次I/O。有个容易忽略的细节：循环里用\texttt{folio\_nr\_pages}更新索引，这样一个order-2的folio会让索引前进4而不是1。大folio和小folio混在一个批量里，逻辑依然正确。
+
+\subsection{错误处理模式}
+
+\begin{lstlisting}[language=C,caption={folio错误处理模式},label={lst:folio-error-handling}]
+/**
+ * 示例：folio操作的错误处理
+ * 
+ * 展示一致的错误处理模式
+ */
+
+int folio_operation_with_error_handling(struct address_space *mapping,
+                                         pgoff_t index)
+{
+    struct folio *folio = NULL;
+    int error = 0;
+    
+    /*
+     * 设计思想：获取资源
+     * folio_alloc返回NULL表示失败
+     */
+    folio = filemap_alloc_folio(GFP_KERNEL, 0);
+    if (!folio) {
+        error = -ENOMEM;
+        goto out;
+    }
+    
+    /*
+     * 加入映射
+     * filemap_add_folio返回错误码
+     */
+    error = filemap_add_folio(mapping, folio, index, GFP_KERNEL);
+    if (error)
+        goto out_put;
+    
+    /*
+     * 锁定folio
+     * folio_lock()不返回错误，但可能睡眠
+     */
+    folio_lock(folio);
+    
+    /*
+     * 执行操作
+     */
+    error = perform_actual_operation(folio);
+    if (error)
+        goto out_unlock;
+    
+    /*
+     * 成功路径
+     */
+    folio_mark_uptodate(folio);
+    
+out_unlock:
+    /*
+     * 设计思想：配对的unlock
+     */
+    folio_unlock(folio);
+    
+out_put:
+    /*
+     * 设计思想：配对的put
+     * 无论成功还是失败，都需要减少引用
+     */
+    folio_put(folio);
+    
+out:
+    return error;
+}
+
+/**
+ * 使用goto的替代方案：__cleanup属性（GCC扩展）
+ */
+#define __cleanup_folio_put __attribute__((cleanup(folio_put_cleanup)))
+
+static void folio_put_cleanup(struct folio **foliop)
+{
+    if (*foliop)
+        folio_put(*foliop);
+}
+
+int folio_operation_with_cleanup(struct address_space *mapping,
+                                  pgoff_t index)
+{
+    __cleanup_folio_put struct folio *folio = NULL;
+    int error;
+    
+    folio = filemap_alloc_folio(GFP_KERNEL, 0);
+    if (!folio)
+        return -ENOMEM;
+    
+    error = filemap_add_folio(mapping, folio, index, GFP_KERNEL);
+    if (error)
+        return error;  /* folio自动释放 */
+    
+    folio_lock(folio);
+    
+    error = perform_actual_operation(folio);
+    
+    folio_unlock(folio);
+    
+    return error;  /* folio自动释放 */
+}
+\end{lstlisting}
+
+两种错误处理模式，各有适用场景。第一种是内核里最经典的goto模式。清理标签按资源获取的逆序排列：\texttt{out\_unlock}先解锁，\texttt{out\_put}再释放引用，\texttt{out}最后返回。无论在哪一步失败，goto到对应的标签就能正确清理已获取的资源。写习惯了其实很顺手。
+
+第二种用了GCC的\texttt{\_\_attribute\_\_((cleanup))}扩展。变量离开作用域时自动调\texttt{folio\_put}释放引用，不需要goto也不需要清理标签，在任何位置直接return就行。这有点像C++的RAII。不过要注意两点：一是这个特性在内核中是近几年才被更广泛采用的，旧代码还是goto模式；二是自动清理只管引用计数，锁还是得自己手动\texttt{folio\_unlock}。
+
+\section{设计哲学的实践意义}
+
+\subsection{对内核开发者的启示}
+
+folio的设计哲学不仅适用于内存管理，也为其他内核子系统的设计提供了参考：
+
+\begin{enumerate}
+    \item \textbf{类型是最好的文档}：通过精心设计的类型系统，可以减少对注释的依赖
+    \item \textbf{渐进式改进}：大规模重构应该分阶段进行，保持向后兼容
+    \item \textbf{API一致性}：统一的命名约定降低学习成本
+    \item \textbf{零成本抽象}：好的抽象不应该带来运行时开销
+    \item \textbf{协同设计}：新抽象应该与其他子系统和谐共存
+\end{enumerate}
+
+\subsection{对应用开发的借鉴}
+
+folio的设计原则也可以应用于应用层开发：
+
+\begin{lstlisting}[language=C,caption={设计原则的应用层示例},label={lst:application-layer-example}]
+/*
+ * 例1：类型安全
+ * 
+ * 不要使用void*传递所有东西
+ * 定义具体的类型来表达语义
+ */
+
+/* 不好的做法 */
+void process_data(void *data, int type);
+
+/* 好的做法 */
+struct user_data { /* ... */ };
+struct system_data { /* ... */ };
+
+void process_user_data(struct user_data *data);
+void process_system_data(struct system_data *data);
+
+/*
+ * 例2：一致的命名
+ */
+/* 不一致 */
+int getUserName(User *u);
+void user_set_email(User *u, char *email);
+char *get_user_address(User *u);
+
+/* 一致 */
+int user_get_name(User *u, char *buf, size_t len);
+int user_set_email(User *u, const char *email);
+int user_get_address(User *u, char *buf, size_t len);
+
+/*
+ * 例3：最小惊讶原则
+ */
+/* 惊讶的行为 */
+int free_user(User *u) {
+    /* 这个函数不仅释放user，还会关闭相关文件 */
+    close(u->log_file);  /* 意外的副作用 */
+    free(u);
+    return 0;
+}
+
+/* 不惊讶的行为 */
+void user_close_log(User *u) {
+    if (u->log_file >= 0)
+        close(u->log_file);
+    u->log_file = -1;
+}
+
+void user_free(User *u) {
+    /* 只做释放，调用者负责先关闭资源 */
+    free(u);
+}
+\end{lstlisting}
+
+这些原则并不只适用于内核。类型安全方面，别用\texttt{void *}加type参数的万金油写法——编译器帮不了你检查类型和type参数是否匹配。定义具体的结构体类型，让编译器帮你干活。
+
+命名一致性方面，\texttt{getUserName}、\texttt{user\_set\_email}、\texttt{get\_user\_address}三种风格混着用，跟旧page API一个毛病。统一成\texttt{user\_xxx\_yyy}之后，不光命名风格一致了，参数约定也统一了——都返回int错误码，字符串通过缓冲区参数返回。最小惊讶原则更是到处适用：\texttt{free\_user}里偷偷关了日志文件，调用者根本不知道。把\texttt{user\_free}和\texttt{user\_close\_log}拆成两个函数，调用者自己决定什么时候关什么时候释放，意图明确。
+
+\section{本章小结}
+
+本章深入探讨了Linux内核folio的设计哲学。通过分析Matthew Wilcox的设计理念，我们理解了folio诞生的思考过程：从识别复合页的问题，到提出类型安全的解决方案，再到设计渐进式迁移策略。
+
+folio的设计体现了以下核心原则：
+
+\begin{enumerate}
+    \item \textbf{类型安全}：通过区分\texttt{struct page}和\texttt{struct folio}，在编译时捕获错误
+    \item \textbf{兼容性}：内存布局与\texttt{struct page}对齐，实现零成本转换
+    \item \textbf{清晰性}：API命名准确描述功能，遵循一致的命名约定
+    \item \textbf{最小惊讶}：行为符合开发者直觉，减少意外
+    \item \textbf{渐进式迁移}：允许新旧代码共存，分阶段完成迁移
+    \item \textbf{协同设计}：与XArray、memcg、THP等子系统良好集成
+\end{enumerate}
+
+这些设计原则不仅使folio成为一个优秀的内核抽象，也为我们在其他项目中的设计工作提供了宝贵的参考。理解这些原则，将帮助我们更好地使用folio API，并在自己的代码中应用类似的设计思想。
+
+在下一章中，我们将深入folio的核心数据结构，详细分析\texttt{struct folio}的每个字段及其实现机制。
+
+\begin{summary}
+\textbf{本章要点回顾：}
+\begin{itemize}
+    \item Matthew Wilcox的核心洞察：复合页的设计是一个历史错误，folio提供了正确的抽象
+    \item 类型安全通过编译时检查捕获错误，消除运行时开销
+    \item folio与page的内存布局兼容确保了零成本转换
+    \item API设计遵循清晰性、一致性、最小惊讶和正交性原则
+    \item 渐进式迁移策略允许数年时间完成全面迁移
+    \item folio与XArray、memcg、THP的协同体现了系统性设计
+    \item 设计中存在权衡，需要在类型安全、性能和复杂度之间平衡
+\end{itemize}
+\end{summary}
+
+
+
+\end{document}

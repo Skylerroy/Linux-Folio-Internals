@@ -1,0 +1,81 @@
+\documentclass[../main.tex]{subfiles}
+\begin{document}
+\chapter{索引}
+\label{appendix:index}
+
+\section*{术语索引}
+
+\begin{description}
+\item[address\_space] 地址空间，用于管理文件的页缓存
+\item[compound page] 复合页，由多个连续物理页组成的逻辑页
+\item[folio] 新的内存管理抽象，替代struct page
+\item[folio\_order] folio的阶数，表示包含2的幂次个页
+\item[folio\_size] folio的总大小（字节数）
+\item[LRU] 最近最少使用（Least Recently Used）算法
+\item[page cache] 页缓存，用于缓存文件数据
+\item[refcount] 引用计数，用于内存管理
+\item[struct page] 传统的内核页描述符结构
+\item[VFS] 虚拟文件系统，Linux文件系统抽象层
+\end{description}
+
+\section*{函数索引}
+
+\begin{description}
+\item[alloc\_folio()] 分配folio对象
+\item[folio\_activate()] 激活folio到活跃LRU链表
+\item[folio\_add\_lru()] 将folio添加到LRU链表
+\item[folio\_clear\_dirty()] 清除folio的脏页标记
+\item[folio\_copy\_from\_iter()] 从iov\_iter拷贝数据到folio
+\item[folio\_copy\_to\_iter()] 将folio数据拷贝到iov\_iter
+\item[folio\_del\_lru()] 从LRU链表删除folio
+\item[folio\_first\_page()] 获取folio的第一个页
+\item[folio\_for\_each\_page()] 遍历folio中的所有页
+\item[folio\_get()] 增加folio引用计数
+\item[folio\_last\_page()] 获取folio的最后一个页
+\item[folio\_lock()] 锁定folio
+\item[folio\_mark\_dirty()] 标记folio为脏页
+\item[folio\_nr\_pages()] 获取folio包含的页数
+\item[folio\_order()] 获取folio的阶数
+\item[folio\_page()] 获取folio中的指定页
+\item[folio\_put()] 减少folio引用计数
+\item[folio\_set\_uptodate()] 标记folio为最新状态
+\item[folio\_size()] 获取folio的总大小
+\item[folio\_test\_compound()] 检查是否为复合folio
+\item[folio\_test\_dirty()] 检查folio是否为脏页
+\item[folio\_test\_uptodate()] 检查folio是否为最新状态
+\item[folio\_unlock()] 解锁folio
+\item[filemap\_get\_folio()] 在页缓存中查找folio
+\item[filemap\_insert\_folio()] 将folio插入页缓存
+\item[kmap\_local\_folio()] 映射folio到内核地址空间
+\item[kunmap\_local()] 取消folio的内核映射
+\item[page\_folio()] 将page转换为folio
+\item[page\_is\_folio\_head()] 检查page是否为folio头页
+\end{description}
+
+\section*{概念索引}
+
+\begin{description}
+\item[内存管理] \hfill \\
+    参见：第1章、第2章、第4章、第12章
+\item[页缓存] \hfill \\
+    参见：第5章、第14章
+\item[文件系统] \hfill \\
+    参见：第6章、第14章
+\item[复合页] \hfill \\
+    参见：第2章、第4章
+\item[引用计数] \hfill \\
+    参见：第4章、第10章
+\item[LRU算法] \hfill \\
+    参见：第5章、第11章
+\item[数据结构] \hfill \\
+    参见：第4章、第7章
+\item[性能优化] \hfill \\
+    参见：第3章、第5章、第6章
+\item[调试工具] \hfill \\
+    参见：第4章、第8章、附录A
+\item[迁移指南] \hfill \\
+    参见：第8章、附录B
+\end{description}
+
+
+\end{document}

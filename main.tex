@@ -1,0 +1,336 @@
+% 深入理解 Linux Folio：从设计思想到代码实现
+% 主文件 main.tex
+
+\documentclass[11pt,a4paper,openany]{book}
+
+% 中文支持
+\usepackage[UTF8]{ctex}
+\usepackage{fontspec}
+
+% 页面设置
+\usepackage[top=2.5cm, bottom=2.5cm, left=3cm, right=3cm]{geometry}
+
+% 代码高亮
+\usepackage{listings}
+\usepackage{xcolor}
+
+% 定义代码样式
+\lstdefinestyle{cstyle}{
+    language=C,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    stepnumber=1,
+    numbersep=8pt,
+    backgroundcolor=\color{gray!5},
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    frame=single,
+    rulecolor=\color{gray!30},
+    tabsize=4,
+    captionpos=b,
+    breaklines=true,
+    breakatwhitespace=false,
+    escapeinside={(*@}{@*)},
+    morekeywords={bool, size_t, sector_t, pgoff_t, loff_t, u8, u16, u32, u64, s8, s16, s32, s64, 
+                  atomic_t, atomic_long_t, spinlock_t, rwlock_t, mutex, 
+                  gfp_t, fgf_t, vm_fault_t,
+                  __always_inline, __must_check, __init, __exit,
+                  likely, unlikely, container_of,
+                  EXPORT_SYMBOL, MODULE_LICENSE, MODULE_AUTHOR,
+                  BUG_ON, WARN_ON, WARN_ON_ONCE, BUILD_BUG_ON,
+                  folio, page, address_space, file, inode, super_block,
+                  bio, bio_vec, request, request_queue}
+}
+
+\lstset{style=cstyle}
+
+% 图表
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,calc,fit,backgrounds}
+
+% 表格
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+
+% 超链接
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,
+    urlcolor=cyan,
+    citecolor=green,
+    pdftitle={深入理解 Linux Folio},
+    pdfauthor={},
+    bookmarks=true,
+}
+
+% 目录深度
+\setcounter{tocdepth}{3}
+\setcounter{secnumdepth}{3}
+
+% 章节样式
+\usepackage{titlesec}
+\titleformat{\chapter}[display]
+    {\normalfont\huge\bfseries}
+    {\chaptertitlename\ \thechapter}
+    {20pt}
+    {\Huge}
+
+% 页眉页脚
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE,RO]{\thepage}
+\fancyhead[RE]{\leftmark}
+\fancyhead[LO]{\rightmark}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% 引用
+\usepackage{epigraph}
+
+% 脚注
+\usepackage{footnote}
+
+% 索引
+\usepackage{makeidx}
+\makeindex
+
+% 附录
+\usepackage{appendix}
+
+% 算法
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% 数学
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+% 分章节编译
+\usepackage{subfiles}
+
+% 自定义函数文档环境
+\newenvironment{functiondesc}[2]{%
+    \paragraph{\texttt{#1}(#2)}
+    \mbox{}\\
+}{%
+    \par\medskip
+}
+
+% 函数参数和返回值命令
+\newcommand{\param}[2]{\noindent\textbf{参数 #1:} #2\par}
+\newcommand{\returns}[1]{\noindent\textbf{返回值:} #1\par}
+
+% 自定义框架环境
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+
+\newtcolorbox{warningbox}{
+    colback=yellow!10,
+    colframe=orange!75!black,
+    title={\textbf{警告}},
+    fonttitle=\bfseries,
+    breakable
+}
+
+\newtcolorbox{keypoints}[1]{
+    colback=blue!5,
+    colframe=blue!75!black,
+    title={#1},
+    fonttitle=\bfseries,
+    breakable
+}
+
+\newtcolorbox{furtherreading}[1]{
+    colback=green!5,
+    colframe=green!75!black,
+    title={#1},
+    fonttitle=\bfseries,
+    breakable
+}
+
+\newtcolorbox{checklistbox}[1]{
+    colback=gray!5,
+    colframe=gray!75!black,
+    title={#1},
+    fonttitle=\bfseries,
+    breakable
+}
+
+%============================================================
+% 文档开始
+%============================================================
+
+\begin{document}
+
+%------------------------------------------------------------
+% 封面
+%------------------------------------------------------------
+\begin{titlepage}
+    \centering
+    \vspace*{3cm}
+    
+    {\Huge\bfseries 深入理解 Linux Folio}\\[0.5cm]
+    {\Large\itshape 从设计思想到代码实现}\\[2cm]
+    
+    {\large 基于 Linux 5.16 -- 6.x 内核}\\[3cm]
+    
+    \vfill
+    
+    {\large 2026年2月}
+\end{titlepage}
+
+%------------------------------------------------------------
+% 版权页
+%------------------------------------------------------------
+\newpage
+\thispagestyle{empty}
+\vspace*{\fill}
+\begin{center}
+    \textbf{深入理解 Linux Folio：从设计思想到代码实现}\\[1cm]
+    内核版本：Linux 5.16 -- 6.x\\[0.5cm]
+    本书基于 GPLv2 许可证发布\\[2cm]
+    
+    \textit{``The folio is the new unit of memory management in the Linux kernel.''}\\
+    \textit{--- Matthew Wilcox}
+\end{center}
+\vspace*{\fill}
+
+%------------------------------------------------------------
+% 前言
+%------------------------------------------------------------
+\chapter*{前言}
+\addcontentsline{toc}{chapter}{前言}
+
+Linux 内核的内存管理子系统是整个操作系统最复杂、最核心的部分之一。在过去的三十年里，\texttt{struct page} 一直是内核表示物理内存页的基础数据结构。然而，随着内核的不断演进，\texttt{struct page} 逐渐暴露出诸多设计上的问题，特别是在处理复合页（compound page）和大页（huge page）时的复杂性。
+
+2021年，Matthew Wilcox 提出了 \textbf{folio} 的概念，并在 Linux 5.16 中首次合并。folio 不是对 \texttt{struct page} 的简单替换，而是一种全新的抽象——它代表一个或多个物理连续页的集合，为内核的内存管理提供了更清晰、更高效的接口。
+
+本书旨在全面、深入地介绍 folio 的设计思想、实现细节和最佳实践。我们将从以下几个方面展开：
+
+\begin{itemize}
+    \item \textbf{历史与动机}：为什么需要 folio？\texttt{struct page} 存在哪些问题？
+    \item \textbf{设计哲学}：folio 的核心设计思想和设计决策
+    \item \textbf{数据结构}：folio 的内部结构和关键字段
+    \item \textbf{API 详解}：完整的 folio API 及其使用方法
+    \item \textbf{子系统集成}：folio 与页缓存、文件系统、内存回收的交互
+    \item \textbf{演进历史}：从 5.16 到 6.x 的发展过程
+    \item \textbf{实践指南}：如何将现有代码迁移到 folio
+\end{itemize}
+
+\subsection*{读者对象}
+
+本书面向以下读者：
+
+\begin{itemize}
+    \item Linux 内核开发者，特别是从事内存管理、文件系统、块设备驱动开发的工程师
+    \item 希望深入理解 Linux 内核内存管理机制的系统程序员
+    \item 对操作系统设计感兴趣的研究人员和学生
+\end{itemize}
+
+阅读本书需要具备以下基础：
+
+\begin{itemize}
+    \item 熟悉 C 语言编程
+    \item 了解基本的操作系统概念（虚拟内存、页表、进程等）
+    \item 有一定的 Linux 内核开发经验（或至少阅读过内核代码）
+\end{itemize}
+
+\subsection*{代码版本}
+
+本书的代码示例基于以下内核版本：
+
+\begin{itemize}
+    \item Linux 5.16：folio 首次引入
+    \item Linux 5.18：folio 在页缓存中的广泛应用
+    \item Linux 6.0：folio API 的稳定化
+    \item Linux 6.x：当前的成熟实现
+\end{itemize}
+
+我们会在相关章节明确标注代码所属的内核版本，并讨论不同版本之间的差异。
+
+\subsection*{致谢}
+
+感谢 Matthew Wilcox 对 folio 的杰出贡献，以及所有参与 folio 开发和审阅的内核开发者。感谢 LWN.net 提供的高质量技术文章，它们是理解 folio 演进的重要参考资料。
+
+\vspace{1cm}
+\hfill 作者
+
+\hfill 2026年2月
+
+%------------------------------------------------------------
+% 目录
+%------------------------------------------------------------
+\tableofcontents
+
+%------------------------------------------------------------
+% 正文
+%------------------------------------------------------------
+
+% 第1章
+\subfile{chapters/chapter01}
+
+% 第2章
+\subfile{chapters/chapter02}
+
+% 第3章
+\subfile{chapters/chapter03}
+
+% 第4章
+\subfile{chapters/chapter04}
+
+% 第5章
+\subfile{chapters/chapter05}
+
+% 第6章
+\subfile{chapters/chapter06}
+
+% 第7章
+\subfile{chapters/chapter07}
+
+% 第8章
+\subfile{chapters/chapter08}
+
+%------------------------------------------------------------
+% 附录
+%------------------------------------------------------------
+\appendix
+
+\subfile{appendix/appendix_a}
+\subfile{appendix/appendix_b}
+\subfile{appendix/appendix_c}
+
+%------------------------------------------------------------
+% 参考文献
+%------------------------------------------------------------
+\chapter*{参考文献}
+\addcontentsline{toc}{chapter}{参考文献}
+
+\begin{enumerate}
+    \item Wilcox, Matthew. "Folios." LWN.net, March 2021.
+    \item Wilcox, Matthew. "Pulling slabs out of struct page." LWN.net, 2021.
+    \item Corbet, Jonathan. "An introduction to compound pages." LWN.net, 2007.
+    \item Linux Kernel Documentation. "Memory Management." \url{https://www.kernel.org/doc/html/latest/mm/}
+    \item Linux Kernel Source Code. \url{https://elixir.bootlin.com/linux/latest/source}
+    \item Gorman, Mel. "Understanding the Linux Virtual Memory Manager." 2004.
+    \item Love, Robert. "Linux Kernel Development." 3rd Edition, 2010.
+    \item Bovet, Daniel P. and Cesati, Marco. "Understanding the Linux Kernel." 3rd Edition, 2005.
+\end{enumerate}
+
+%------------------------------------------------------------
+% 索引
+%------------------------------------------------------------
+\printindex
+
+\end{document}

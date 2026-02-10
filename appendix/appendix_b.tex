@@ -1,0 +1,585 @@
+\documentclass[../main.tex]{subfiles}
+\begin{document}
+\chapter{从struct page到folio迁移指南}
+\label{appendix:migration-guide}
+
+\section{迁移概述}
+
+从传统的\texttt{struct page}迁移到folio是一个渐进的过程，需要仔细规划和系统性的实施。本指南提供了完整的迁移路线图和最佳实践。
+
+\section{迁移准备阶段}
+
+\subsection{代码评估}
+
+在开始迁移之前，需要对现有代码进行全面评估：
+
+\begin{lstlisting}[language=bash,caption={代码评估脚本}]
+#!/bin/bash
+# 评估现有page使用情况的脚本
+
+KERNEL_SRC="/lib/modules/$(uname -r)/build"
+CODEBASE="."
+
+echo "=== Page Usage Analysis ==="
+
+# 统计page相关函数调用
+echo "1. Page function call statistics:"
+grep -r "page_" $CODEBASE --include="*.c" --include="*.h" | \
+    grep -o "page_[a-zA-Z0-9_]*" | sort | uniq -c | sort -nr | head -20
+
+# 统计复合页相关代码
+echo -e "\n2. Compound page usage:"
+grep -r "compound" $CODEBASE --include="*.c" --include="*.h" | wc -l
+
+# 统计页缓存相关代码
+echo -e "\n3. Page cache operations:"
+grep -r "page_cache" $CODEBASE --include="*.c" --include="*.h" | wc -l
+
+# 统计锁定相关代码
+echo -e "\n4. Page locking operations:"
+grep -r "lock_page\|unlock_page" $CODEBASE --include="*.c" --include="*.h" | wc -l
+\end{lstlisting}
+
+\subsection{依赖分析}
+
+\begin{lstlisting}[language=C,caption={依赖分析工具}]
+struct migration_dependency {
+    const char *file_path;
+    const char *function_name;
+    enum dependency_type {
+        DIRECT_PAGE_ACCESS,     /* 直接访问page结构 */
+        PAGE_FUNCTION_CALL,     /* 调用page相关函数 */
+        COMPOUND_PAGE_USE,      /* 使用复合页 */
+        PAGE_CACHE_OPERATION,   /* 页缓存操作 */
+        PAGE_LOCKING,          /* 页面锁定 */
+    } type;
+    bool has_folio_alternative; /* 是否有folio替代方案 */
+    int complexity;            /* 迁移复杂度 (1-5) */
+};
+
+static struct migration_dependency *analyze_dependencies(const char *path)
+{
+    struct migration_dependency *deps = NULL;
+    /* 实现依赖分析逻辑 */
+    return deps;
+}
+\end{lstlisting}
+
+\section{渐进式迁移策略}
+
+\subsection{第一阶段：兼容层实现}
+
+创建folio和page之间的兼容层：
+
+\begin{lstlisting}[language=C,caption={兼容层实现}]
+/* 兼容层头文件 */
+#ifndef _LINUX_FOLIO_COMPAT_H
+#define _LINUX_FOLIO_COMPAT_H
+
+/* 条件编译支持 */
+#ifdef CONFIG_FOLIO_MIGRATION
+#define USE_FOLIO 1
+#else
+#define USE_FOLIO 0
+#endif
+
+/* 兼容宏定义 */
+#if USE_FOLIO
+#define page_operation(folio_ptr) folio_##folio_ptr
+#define PAGE_TYPE struct folio *
+#else
+#define page_operation(page_ptr) page_##page_ptr
+#define PAGE_TYPE struct page *
+#endif
+
+/* 混合操作函数 */
+static inline void safe_page_get(void *page_or_folio)
+{
+#if USE_FOLIO
+    if (is_folio_address(page_or_folio)) {
+        folio_get((struct folio *)page_or_folio);
+    } else {
+        get_page((struct page *)page_or_folio);
+    }
+#else
+    get_page((struct page *)page_or_folio);
+#endif
+}
+
+#endif /* _LINUX_FOLIO_COMPAT_H */
+\end{lstlisting}
+
+\subsection{第二阶段：核心函数替换}
+
+逐步替换核心操作函数：
+
+\begin{lstlisting}[language=C,caption={核心函数替换示例}]
+/* 旧的page操作函数 */
+static int old_page_read_operation(struct page *page)
+{
+    lock_page(page);
+    /* 执行读操作 */
+    unlock_page(page);
+    return 0;
+}
+
+/* 新的folio操作函数 */
+static int new_folio_read_operation(struct folio *folio)
+{
+    folio_lock(folio);
+    /* 执行读操作 */
+    folio_unlock(folio);
+    return 0;
+}
+
+/* 渐进式替换包装函数 */
+static int progressive_read_operation(void *page_or_folio)
+{
+#ifdef CONFIG_FOLIO_MIGRATION
+    if (is_folio_address(page_or_folio)) {
+        return new_folio_read_operation((struct folio *)page_or_folio);
+    }
+#endif
+    return old_page_read_operation((struct page *)page_or_folio);
+}
+\end{lstlisting}
+
+\section{具体迁移步骤}
+
+\subsection{步骤1：基础数据结构替换}
+
+\begin{lstlisting}[language=C,caption={数据结构迁移}]
+/* 旧的数据结构 */
+struct my_page_cache {
+    struct page *pages[MAX_PAGES];
+    unsigned int count;
+};
+
+/* 新的数据结构 */
+struct my_folio_cache {
+    struct folio *folios[MAX_FOLIOS];
+    unsigned int count;
+};
+
+/* 迁移函数 */
+static int migrate_page_cache_to_folio(struct my_page_cache *old_cache,
+                                     struct my_folio_cache *new_cache)
+{
+    int i;
+    
+    new_cache->count = old_cache->count;
+    
+    for (i = 0; i < old_cache->count; i++) {
+        struct page *page = old_cache->pages[i];
+        new_cache->folios[i] = page_folio(page);
+        /* 增加folio引用计数 */
+        folio_get(new_cache->folios[i]);
+        /* 释放旧的page引用 */
+        put_page(page);
+    }
+    
+    return 0;
+}
+\end{lstlisting}
+
+\subsection{步骤2：函数接口更新}
+
+\begin{lstlisting}[language=C,caption={接口更新示例}]
+/* 旧的函数接口 */
+int process_pages(struct page **pages, int count);
+
+/* 新的folio接口 */
+int process_folios(struct folio **folios, int count);
+
+/* 兼容性包装函数 */
+int process_pages_compat(void **pages_or_folios, int count)
+{
+#ifdef CONFIG_FOLIO_MIGRATION
+    if (is_folio_array(pages_or_folios, count)) {
+        return process_folios((struct folio **)pages_or_folios, count);
+    }
+#endif
+    return process_pages((struct page **)pages_or_folios, count);
+}
+\end{lstlisting}
+
+\subsection{步骤3：内存管理优化}
+
+\begin{lstlisting}[language=C,caption={内存管理迁移}]
+/* 旧的内存分配 */
+struct page *alloc_page_array(int count)
+{
+    struct page *pages = kmalloc(sizeof(struct page *) * count, GFP_KERNEL);
+    int i;
+    
+    for (i = 0; i < count; i++) {
+        pages[i] = alloc_page(GFP_KERNEL);
+        if (!pages[i]) {
+            /* 清理已分配的页面 */
+            while (--i >= 0)
+                __free_page(pages[i]);
+            kfree(pages);
+            return NULL;
+        }
+    }
+    return pages;
+}
+
+/* 新的folio分配 */
+struct folio *alloc_folio_array(int count)
+{
+    struct folio *folios = kmalloc(sizeof(struct folio *) * count, GFP_KERNEL);
+    int i;
+    
+    for (i = 0; i < count; i++) {
+        folios[i] = alloc_folio(GFP_KERNEL, 0);
+        if (!folios[i]) {
+            /* 清理已分配的folio */
+            while (--i >= 0)
+                folio_put(folios[i]);
+            kfree(folios);
+            return NULL;
+        }
+    }
+    return folios;
+}
+\end{lstlisting}
+
+\section{测试和验证}
+
+\subsection{单元测试框架}
+
+\begin{lstlisting}[language=C,caption={迁移测试框架}]
+struct migration_test_case {
+    const char *name;
+    int (*test_function)(void);
+    bool expect_success;
+    const char *description;
+};
+
+static int test_folio_allocation(void)
+{
+    struct folio *folio;
+    
+    /* 测试基本分配 */
+    folio = alloc_folio(GFP_KERNEL, 0);
+    if (!folio)
+        return -ENOMEM;
+    
+    /* 验证folio属性 */
+    if (folio_order(folio) != 0) {
+        folio_put(folio);
+        return -EINVAL;
+    }
+    
+    if (folio_nr_pages(folio) != 1) {
+        folio_put(folio);
+        return -EINVAL;
+    }
+    
+    /* 清理 */
+    folio_put(folio);
+    return 0;
+}
+
+static int test_folio_conversion(void)
+{
+    struct page *page;
+    struct folio *folio;
+    
+    /* 分配page并转换为folio */
+    page = alloc_page(GFP_KERNEL);
+    if (!page)
+        return -ENOMEM;
+    
+    folio = page_folio(page);
+    if (!folio) {
+        __free_page(page);
+        return -EINVAL;
+    }
+    
+    /* 验证转换正确性 */
+    if (folio_page(folio, 0) != page) {
+        __free_page(page);
+        return -EINVAL;
+    }
+    
+    /* 清理 */
+    __free_page(page);
+    return 0;
+}
+
+static struct migration_test_case migration_tests[] = {
+    {
+        .name = "folio_allocation",
+        .test_function = test_folio_allocation,
+        .expect_success = true,
+        .description = "测试folio基本分配功能"
+    },
+    {
+        .name = "folio_conversion",
+        .test_function = test_folio_conversion,
+        .expect_success = true,
+        .description = "测试page到folio的转换"
+    },
+    /* 更多测试用例... */
+};
+\end{lstlisting}
+
+\subsection{性能基准测试}
+
+\begin{lstlisting}[language=C,caption={性能基准测试}]
+struct performance_benchmark {
+    const char *name;
+    unsigned long iterations;
+    int (*old_function)(void);
+    int (*new_function)(void);
+    unsigned long old_time;
+    unsigned long new_time;
+    double improvement_ratio;
+};
+
+static unsigned long time_function(int (*func)(void), unsigned long iterations)
+{
+    struct timespec64 start, end;
+    unsigned long i;
+    int ret;
+    
+    ktime_get_ts64(&start);
+    for (i = 0; i < iterations; i++) {
+        ret = func();
+        if (ret)
+            break;
+    }
+    ktime_get_ts64(&end);
+    
+    return timespec64_to_ns(&end) - timespec64_to_ns(&start);
+}
+
+static void run_performance_benchmark(struct performance_benchmark *bench)
+{
+    pr_info("Running benchmark: %s\n", bench->name);
+    
+    /* 测试旧实现 */
+    bench->old_time = time_function(bench->old_function, bench->iterations);
+    
+    /* 测试新实现 */
+    bench->new_time = time_function(bench->new_function, bench->iterations);
+    
+    /* 计算性能提升 */
+    if (bench->new_time > 0) {
+        bench->improvement_ratio = (double)bench->old_time / bench->new_time;
+    }
+    
+    pr_info("  Old implementation: %lu ns\n", bench->old_time);
+    pr_info("  New implementation: %lu ns\n", bench->new_time);
+    pr_info("  Performance improvement: %.2fx\n", bench->improvement_ratio);
+}
+\end{lstlisting}
+
+\section{常见问题和解决方案}
+
+\subsection{内存泄漏问题}
+
+\begin{lstlisting}[language=C,caption={内存泄漏检测}]
+/* 内存泄漏检测工具 */
+static void check_folio_leaks(void)
+{
+    struct folio *folio;
+    unsigned long leaked_count = 0;
+    
+    /* 遍历所有已分配的folio */
+    spin_lock(&folio_list_lock);
+    list_for_each_entry(folio, &global_folio_list, lru) {
+        /* 检查引用计数异常 */
+        if (atomic_read(&folio->_refcount) <= 0) {
+            pr_err("Folio %p has invalid refcount: %d\n",
+                   folio, atomic_read(&folio->_refcount));
+            leaked_count++;
+        }
+        
+        /* 检查锁定状态异常 */
+        if (folio_test_locked(folio) && 
+            !folio_test_owner(folio, current)) {
+            pr_warn("Folio %p is locked by another process\n", folio);
+        }
+    }
+    spin_unlock(&folio_list_lock);
+    
+    if (leaked_count > 0) {
+        pr_err("Found %lu potentially leaked folios\n", leaked_count);
+    }
+}
+\end{lstlisting}
+
+\subsection{竞态条件处理}
+
+\begin{lstlisting}[language=C,caption={竞态条件防护}]
+/* 安全的folio操作模板 */
+static int safe_folio_operation(struct folio *folio, 
+                               int (*operation)(struct folio *))
+{
+    int ret;
+    
+    /* 预检查 */
+    if (!folio)
+        return -EINVAL;
+    
+    /* 原子锁定 */
+    if (folio_lock_killable(folio))
+        return -EINTR;
+    
+    /* 再次验证folio状态 */
+    if (folio_test_hwpoison(folio)) {
+        ret = -EHWPOISON;
+        goto unlock;
+    }
+    
+    /* 执行操作 */
+    ret = operation(folio);
+    
+unlock:
+    folio_unlock(folio);
+    return ret;
+}
+
+/* 使用示例 */
+static int my_folio_operation(struct folio *folio)
+{
+    return safe_folio_operation(folio, do_actual_operation);
+}
+\end{lstlisting}
+
+\section{回滚策略}
+
+\subsection{配置开关实现}
+
+\begin{lstlisting}[language=C,caption={运行时配置开关}]
+/* 配置管理结构 */
+struct folio_migration_config {
+    bool enabled;                    /* folio功能是否启用 */
+    bool fallback_to_page;          /* 失败时是否回退到page */
+    unsigned int compatibility_mode; /* 兼容模式级别 */
+    bool debug_mode;                /* 调试模式 */
+};
+
+static struct folio_migration_config migration_config = {
+    .enabled = IS_ENABLED(CONFIG_FOLIO_DEFAULT_ENABLED),
+    .fallback_to_page = true,
+    .compatibility_mode = 2,  /* 中等兼容性 */
+    .debug_mode = false,
+};
+
+/* 运行时配置接口 */
+static int set_folio_migration_enabled(const char *val, 
+                                     const struct kernel_param *kp)
+{
+    int ret;
+    bool old_state = migration_config.enabled;
+    
+    ret = param_set_bool(val, kp);
+    if (ret)
+        return ret;
+    
+    /* 状态变更处理 */
+    if (old_state != migration_config.enabled) {
+        if (migration_config.enabled) {
+            pr_info("Folio migration enabled\n");
+            /* 执行启用初始化 */
+            folio_migration_init();
+        } else {
+            pr_info("Folio migration disabled\n");
+            /* 执行禁用清理 */
+            folio_migration_cleanup();
+        }
+    }
+    
+    return 0;
+}
+
+static const struct kernel_param_ops folio_enabled_ops = {
+    .set = set_folio_migration_enabled,
+    .get = param_get_bool,
+};
+
+module_param_cb(folio_enabled, &folio_enabled_ops, 
+                &migration_config.enabled, 0644);
+\end{lstlisting}
+
+\subsection{渐进式回滚机制}
+
+\begin{lstlisting}[language=C,caption={渐进式回滚}]
+/* 回滚管理器 */
+struct rollback_manager {
+    struct list_head rollback_points;
+    unsigned int current_level;
+    bool rollback_in_progress;
+};
+
+struct rollback_point {
+    struct list_head list;
+    unsigned int level;
+    void (*rollback_function)(void);
+    void *rollback_data;
+};
+
+static int register_rollback_point(unsigned int level,
+                                 void (*rollback_func)(void),
+                                 void *data)
+{
+    struct rollback_point *point;
+    
+    if (rollback_mgr.rollback_in_progress)
+        return -EBUSY;
+    
+    point = kmalloc(sizeof(*point), GFP_KERNEL);
+    if (!point)
+        return -ENOMEM;
+    
+    point->level = level;
+    point->rollback_function = rollback_func;
+    point->rollback_data = data;
+    
+    list_add_tail(&point->list, &rollback_mgr.rollback_points);
+    rollback_mgr.current_level = level;
+    
+    return 0;
+}
+
+static void execute_rollback(void)
+{
+    struct rollback_point *point, *tmp;
+    
+    rollback_mgr.rollback_in_progress = true;
+    
+    /* 按逆序执行回滚 */
+    list_for_each_entry_safe_reverse(point, tmp, 
+                                   &rollback_mgr.rollback_points, list) {
+        if (point->rollback_function) {
+            point->rollback_function();
+        }
+        list_del(&point->list);
+        kfree(point);
+    }
+    
+    rollback_mgr.rollback_in_progress = false;
+    rollback_mgr.current_level = 0;
+}
+\end{lstlisting}
+
+\section{总结}
+
+folio迁移是一个复杂但值得的投资。通过遵循本指南的步骤和最佳实践，可以确保迁移过程的平稳和成功。关键要点包括：
+
+\begin{itemize}
+    \item 采用渐进式迁移策略，避免一次性大规模改动
+    \item 实现完善的兼容层和回滚机制
+    \item 建立全面的测试和监控体系
+    \item 保持代码的可维护性和可读性
+    \item 充分利用folio提供的性能和功能优势
+\end{itemize}
+
+成功的迁移不仅能够提升系统性能，还能为未来的内核发展奠定坚实基础。
+
+
+\end{document}

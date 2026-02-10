@@ -1,0 +1,1232 @@
+\documentclass[../main.tex]{subfiles}
+\begin{document}
+\chapter{folio核心数据结构}
+\label{chap:core-data-structures}
+
+\begin{epigraph}
+\textit{``Data structures, not algorithms, are central to programming.''}
+\begin{flushright}
+--- Rob Pike, ``Notes on Programming in C''
+\end{flushright}
+\end{epigraph}
+
+\section{引言}
+
+在计算机科学中，数据结构是程序设计的基石。Linux内核中的folio抽象也不例外——它的强大功能很大程度上源于精心设计的数据结构。本章将深入剖析folio的核心数据结构，从最基础的定义开始，逐步揭示其内部实现机制。
+
+理解folio的数据结构不仅有助于我们正确使用folio API，更能帮助我们理解内核开发者在设计时的考量和权衡。正如Donald Knuth所说：``程序 = 算法 + 数据结构''，folio的设计完美诠释了这一经典理念。
+
+本章将涵盖以下核心内容：
+\begin{itemize}
+    \item \texttt{struct folio}的完整定义和字段解析
+    \item folio与\texttt{struct page}的关系和内存布局
+    \item folio标志位的设计和使用
+    \item 引用计数机制的实现
+    \item LRU链表管理
+    \item 私有数据和映射信息
+    \item 复合页的表示和管理
+    \item 内存对齐和布局优化
+\end{itemize}
+
+\section{struct folio的完整定义}
+
+\subsection{基本结构定义}
+
+folio的核心数据结构定义在\texttt{include/linux/mm\_types.h}中。让我们首先看完整的定义：
+
+\begin{lstlisting}[language=C,caption={struct folio完整定义},label={lst:struct-folio-full}]
+struct folio {
+    /* 第一部分：与struct page兼容的字段 */
+    union {
+        struct {
+            unsigned long flags;
+            struct list_head lru;
+            struct address_space *mapping;
+            pgoff_t index;
+            void *private;
+            atomic_t _mapcount;
+            atomic_t _refcount;
+        };
+        struct page page;
+    };
+    
+    /* 第二部分：folio特有的字段 */
+    unsigned long _flags_1;
+    unsigned long _head_1;
+    unsigned long _folio_dtor;
+    unsigned long _folio_order;
+    atomic_t _total_mapcount;
+    atomic_t _pincount;
+};
+\end{lstlisting}
+
+注意这里的关键设计：一个匿名union把显式声明的字段和完整的\texttt{struct page}叠在同一块内存上。为什么要这么做？因为内核中有海量代码直接操作\texttt{struct page}指针，folio必须在二进制层面和它完全兼容，否则迁移成本不可接受。
+
+第一部分的字段你大概都熟悉：\texttt{flags}存各种状态标志位，\texttt{lru}把folio挂进LRU回收链表，\texttt{mapping}指向所属的\texttt{address\_space}（文件或匿名映射的管理结构），\texttt{index}是在\texttt{address\_space}中的页偏移，\texttt{private}留给文件系统塞私有数据（典型的如buffer\_head），\texttt{\_mapcount}跟踪页表映射数，\texttt{\_refcount}跟踪引用计数。这些和\texttt{struct page}一模一样。
+
+真正有意思的是第二部分——folio独有的扩展字段。\texttt{\_folio\_order}记录阶数，一个order为$n$的folio包含$2^{order}$个连续物理页。\texttt{\_total\_mapcount}把大folio所有子页的映射计数汇总到一起，省得你挨个去加。\texttt{\_pincount}防止DMA操作进行时页面被迁移或回收。\texttt{\_folio\_dtor}是析构函数指针，不同类型的folio释放时走不同的清理逻辑。这些字段在\texttt{struct page}时代要么靠各种hack塞进去，要么干脆没有。
+
+\subsection{内存布局分析}
+
+理解folio的内存布局对于掌握其工作机制至关重要。folio的内存布局体现了以下关键设计点：
+\begin{itemize}
+\item union确保与struct page的兼容性
+\item 前7个字段与struct page完全一致
+\item 后续字段提供扩展功能
+\item 64字节对齐优化缓存性能
+\end{itemize}
+
+\section{与struct page的关系}
+
+\subsection{兼容性设计}
+
+folio设计的核心挑战之一是如何在保持向后兼容性的同时提供新的功能。解决方案是通过union结构实现：
+
+\begin{lstlisting}[language=C,caption={兼容性实现示例},label={lst:compatibility-example}]
+/* 现有的page操作代码可以无缝工作 */
+void existing_page_function(struct page *page)
+{
+    /* 这些操作对folio同样有效 */
+    get_page(page);           /* 引用计数 */
+    lock_page(page);          /* 页面锁定 */
+    page_cache_get(page);     /* 页缓存操作 */
+}
+
+/* 新的folio操作提供额外功能 */
+void new_folio_function(struct folio *folio)
+{
+    /* folio特有的操作 */
+    folio_get(folio);         /* 更高效的引用计数 */
+    folio_lock(folio);        /* 专门的folio锁定 */
+    folio_test_uptodate(folio); /* 类型安全的标志检查 */
+}
+\end{lstlisting}
+
+这里的重点不是这些函数做了什么——代码本身已经很清楚了。重点在于：旧的page API和新的folio API可以同时工作在同一个对象上。你手里有个folio，取它的\texttt{.page}成员传给\texttt{get\_page}、\texttt{lock\_page}，完全没问题，因为内存布局是一样的。
+
+那为什么还要搞一套\texttt{folio\_get}、\texttt{folio\_lock}？两个原因。第一，folio指针天然指向头页，省掉了\texttt{compound\_head}的间接查找——后面汇编分析那节会看到这能省多少条指令。第二，类型安全。你把一个尾页指针传给\texttt{folio\_test\_uptodate}，编译器直接报错；但传给旧的\texttt{PageUptodate}，编译能过，运行时才出问题。这种双轨设计让内核子系统可以一个一个地迁移到folio API，不用一口气改完所有代码。
+
+\subsection{类型转换机制}
+
+内核提供了多种类型转换函数来在page和folio之间安全转换：
+
+\begin{lstlisting}[language=C,caption={类型转换函数},label={lst:conversion-functions}]
+/* 从page转换为folio */
+static inline struct folio *page_folio(struct page *page)
+{
+    return container_of(page, struct folio, page);
+}
+
+/* 从folio获取page指针 */
+static inline struct page *folio_page(struct folio *folio, 
+                                    unsigned int n)
+{
+    return &folio->page + n;
+}
+
+/* 检查page是否是folio的第一页 */
+static inline bool page_is_folio_head(struct page *page)
+{
+    return PageHead(page);
+}
+\end{lstlisting}
+
+\texttt{page\_folio}用\texttt{container\_of}从page指针反推folio指针。因为\texttt{page}成员在union的起始位置（偏移量为0），数值上两个指针其实相同，但\texttt{container\_of}给你类型安全——这比强制类型转换靠谱得多。
+
+\texttt{folio\_page}做反方向的事：给一个folio和索引\texttt{n}，拿到第\texttt{n}个子页的page指针。就是指针算术，没什么魔法。\texttt{n}为0就是头页，大于0就是尾页。
+
+\texttt{page\_is\_folio\_head}检查一个page是不是某个folio的头页。你遍历\texttt{mem\_map}数组的时候会用到它——碰到头页才处理，跳过所有尾页，避免对同一个folio重复操作。
+
+\section{folio标志位系统}
+
+\subsection{标志位设计原则}
+
+folio的标志位系统是其核心特性之一。相比传统的\texttt{struct page}，folio提供了更加丰富和类型安全的标志管理：
+
+\begin{lstlisting}[language=C,caption={folio标志位定义},label={lst:folio-flags}]
+/* folio特有标志位 (定义在 include/linux/page-flags.h) */
+enum folio_flags {
+    /* 基础状态标志 */
+    FG_active        = 1 << 0,    /* 在活跃LRU链表中 */
+    FG_dirty         = 1 << 1,    /* 脏页 */
+    FG_uptodate      = 1 << 2,    /* 页面内容是最新的 */
+    FG_error         = 1 << 3,    /* I/O错误 */
+    FG_referenced    = 1 << 4,    /* 被引用过 */
+    
+    /* 内存管理标志 */
+    FG_locked        = 1 << 5,    /* 页面被锁定 */
+    FG_private       = 1 << 6,    /* 有私有数据 */
+    FG_private_2     = 1 << 7,    /* 第二个私有标志 */
+    FG_swapbacked    = 1 << 8,    /* 后备存储是交换空间 */
+    
+    /* 复合页标志 */
+    FG_compound_head = 1 << 9,    /* 复合页头页 */
+    FG_compound_tail = 1 << 10,   /* 复合页尾页 */
+    FG_large_rmappable = 1 << 11, /* 大页可重映射 */
+    
+    /* 特殊用途标志 */
+    FG_checked       = 1 << 12,   /* 已检查 */
+    FG_pinned        = 1 << 13,   /* 被固定 */
+    FG_savepinned    = 1 << 14,   /* 保存固定状态 */
+    FG_reserved      = 1 << 15,   /* 保留页 */
+};
+\end{lstlisting}
+
+标志位分了四组，我们重点看几个容易搞混的。\texttt{FG\_dirty}和\texttt{FG\_uptodate}经常成对出现：一个folio可以同时是dirty和uptodate的——内容是最新的，但还没写回磁盘。\texttt{FG\_referenced}是LRU回收算法的关键输入，内核用它来实现二次机会策略：被引用过的页面不会被立刻回收，而是先清掉这个标志再给一次机会。
+
+\texttt{FG\_locked}是个位锁，后面会详细讲。\texttt{FG\_private}告诉你这个folio关联了文件系统的私有数据，回收之前得先把这些数据处理掉。\texttt{FG\_swapbacked}区分了匿名页和文件页——匿名页的后备存储是交换空间，文件页的后备存储是文件系统，回收路径完全不同。
+
+复合页标志和特殊用途标志代码里注释已经写得很清楚，不再赘述。
+
+\subsection{标志位操作API}
+
+folio提供了一套类型安全的标志位操作函数：
+
+\begin{lstlisting}[language=C,caption={标志位操作函数},label={lst:flag-operations}]
+/* 类型安全的标志测试 */
+static inline bool folio_test_uptodate(struct folio *folio)
+{
+    return test_bit(PG_uptodate, &folio->flags);
+}
+
+static inline bool folio_test_dirty(struct folio *folio)
+{
+    return test_bit(PG_dirty, &folio->flags);
+}
+
+/* 原子标志设置和清除 */
+static inline void folio_set_uptodate(struct folio *folio)
+{
+    set_bit(PG_uptodate, &folio->flags);
+}
+
+static inline void folio_clear_dirty(struct folio *folio)
+{
+    clear_bit(PG_dirty, &folio->flags);
+}
+
+/* 条件设置操作 */
+static inline bool folio_test_set_dirty(struct folio *folio)
+{
+    return test_and_set_bit(PG_dirty, &folio->flags);
+}
+
+static inline bool folio_test_clear_uptodate(struct folio *folio)
+{
+    return test_and_clear_bit(PG_uptodate, &folio->flags);
+}
+\end{lstlisting}
+
+三种操作模式，复杂度递增。纯测试（\texttt{folio\_test\_*}）是只读的，不需要任何锁就能安全调用。原子设置和清除（\texttt{folio\_set\_*}、\texttt{folio\_clear\_*}）在x86上编译成带\texttt{lock}前缀的位操作指令，多个CPU同时改同一个folio的不同标志位也不会出问题。
+
+最有意思的是第三种：\texttt{folio\_test\_set\_dirty}这类``测试并修改''的复合原子操作。它在设置标志位的同时返回旧值。为什么需要这个？想想看：你要标记一个folio为脏页，但如果它已经是脏的，你就不需要再做一次记账操作。用普通的test再set，两步之间可能有别的CPU插进来。\texttt{test\_and\_set\_bit}一条指令搞定，没有竞态窗口。
+
+\section{引用计数机制}
+
+\subsection{双重引用计数设计}
+
+folio采用了双重引用计数机制，这解决了传统\texttt{struct page}在复合页场景下的问题：
+
+\begin{lstlisting}[language=C,caption={引用计数字段},label={lst:refcount-fields}]
+struct folio {
+    union {
+        struct {
+            /* ... 其他字段 ... */
+            atomic_t _mapcount;    /* 映射引用计数 */
+            atomic_t _refcount;    /* 页面引用计数 */
+        };
+        struct page page;
+    };
+    /* folio特有字段 */
+    atomic_t _total_mapcount;      /* 总映射计数 */
+    atomic_t _pincount;           /* 固定计数 */
+};
+\end{lstlisting}
+
+四个\texttt{atomic\_t}字段，分工明确。\texttt{\_refcount}追踪通用引用——页缓存持有一个，DMA持有一个，降到0就可以释放。\texttt{\_mapcount}只追踪页表映射，初始值是$-1$（没有映射），每加一个页表项就递增1。注意，0表示``恰好一个映射''而不是``没有映射''，这个off-by-one新手很容易踩坑。
+
+为什么要把引用计数和映射计数分开？因为``有人在用这个folio''和``有页表指向这个folio''是两码事。页缓存里的folio没有任何进程映射也完全正常。\texttt{\_total\_mapcount}只在大folio中有意义，它把所有子页的映射计数加到一起。\texttt{\_pincount}防止DMA操作期间页面被迁移——你正在做直接I/O，页面跑了可就麻烦了。
+
+\subsection{引用计数操作函数}
+
+\begin{lstlisting}[language=C,caption={引用计数API},label={lst:refcount-api}]
+/* 获取folio引用 */
+void folio_get(struct folio *folio)
+{
+    VM_BUG_ON_FOLIO(!atomic_read(&folio->_refcount), folio);
+    atomic_inc(&folio->_refcount);
+}
+
+/* 释放folio引用 */
+void folio_put(struct folio *folio)
+{
+    if (atomic_dec_and_test(&folio->_refcount))
+        __folio_put(folio);
+}
+
+/* 获取folio映射引用 */
+void folio_get_mapping(struct folio *folio)
+{
+    atomic_inc(&folio->_mapcount);
+}
+
+/* 释放folio映射引用 */
+void folio_put_mapping(struct folio *folio)
+{
+    if (atomic_dec_and_test(&folio->_mapcount))
+        __folio_put_mapping(folio);
+}
+\end{lstlisting}
+
+\texttt{folio\_get}里那个\texttt{VM\_BUG\_ON\_FOLIO}是防御性编程：如果引用计数已经是0了你还来get，说明你拿到了一个已经被释放的folio，这是严重的use-after-free bug。调试内核会直接panic让你知道，生产内核里这个检查会被编译器优化掉。
+
+\texttt{folio\_put}的逻辑很经典：\texttt{atomic\_dec\_and\_test}把递减和零值检测合成一步原子操作。绝大多数时候引用计数大于1，减完就完事了，这是快速路径。只有最后一个引用被释放时才走\texttt{\_\_folio\_put}——LRU移除、页缓存清理、内存归还，全套流程。
+
+映射计数那边的\texttt{folio\_get\_mapping}和\texttt{folio\_put\_mapping}模式类似，但注意\texttt{\_mapcount}回到$-1$（不是0）才表示没有映射了。
+
+\section{LRU链表管理}
+
+\subsection{LRU链表结构}
+
+folio继承了\texttt{struct page}的LRU链表管理机制，但提供了更清晰的接口：
+
+\begin{lstlisting}[language=C,caption={LRU链表字段},label={lst:lru-fields}]
+struct folio {
+    union {
+        struct {
+            unsigned long flags;
+            struct list_head lru;  /* LRU链表节点 */
+            struct address_space *mapping;
+            /* ... 其他字段 ... */
+        };
+        struct page page;
+    };
+    /* ... 其他folio字段 ... */
+};
+\end{lstlisting}
+
+\texttt{lru}是一个\texttt{struct list\_head}双向链表节点，每个folio通过它挂在五条LRU链表之一上：活跃文件页、不活跃文件页、活跃匿名页、不活跃匿名页、不可回收页。一个细节值得留意：\texttt{lru}紧跟在\texttt{flags}后面，两个字段在同一条缓存行内。这不是巧合——内存回收路径几乎总是先检查标志位，紧接着操作LRU链表，把它们放在一起可以避免额外的cache miss。
+
+\subsection{LRU操作函数}
+
+\begin{lstlisting}[language=C,caption={LRU链表操作},label={lst:lru-operations}]
+/* 将folio添加到LRU链表 */
+void folio_add_lru(struct folio *folio)
+{
+    VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+    lru_cache_add(&folio->page);
+}
+
+/* 从LRU链表删除folio */
+void folio_del_lru(struct folio *folio)
+{
+    if (folio_test_lru(folio)) {
+        folio_clear_lru(folio);
+        del_page_from_lru_list(&folio->page, folio_pgdat(folio));
+    }
+}
+
+/* 激活folio (移动到活跃LRU) */
+void folio_activate(struct folio *folio)
+{
+    if (folio_test_idle(folio))
+        folio_clear_idle(folio);
+    folio_set_active(folio);
+}
+\end{lstlisting}
+
+\texttt{folio\_add\_lru}有个容易忽略的地方：它并不是直接操作全局LRU链表，而是把folio先扔进per-CPU的pagevec批处理缓冲区。缓冲区满了才批量转移到全局链表。为什么？因为全局LRU链表有锁保护，每次add都去抢锁太贵了，攒一批一起做可以大幅减少锁竞争。
+
+\texttt{folio\_del\_lru}先检查\texttt{FG\_lru}标志——如果folio压根不在LRU上，就什么都不做。注意它需要通过\texttt{folio\_pgdat}找到folio所属的NUMA节点，因为每个节点维护自己独立的LRU链表集。
+
+\texttt{folio\_activate}把folio从不活跃链表提升到活跃链表。这是二次机会回收算法的核心：页面被访问时设置active标志，回收扫描碰到active的页面不会立即回收，而是清掉标志给它第二次机会。
+
+\section{复合页表示}
+
+\subsection{复合页支持}
+
+folio最重要的特性之一是对复合页的原生支持。传统\texttt{struct page}通过复杂的宏和函数来处理复合页，而folio将其内建到数据结构中：
+
+\begin{lstlisting}[language=C,caption={复合页字段},label={lst:compound-fields}]
+struct folio {
+    union {
+        struct {
+            /* ... 基础字段 ... */
+        };
+        struct page page;
+    };
+    
+    /* 复合页相关字段 */
+    unsigned long _flags_1;        /* 扩展标志位 */
+    unsigned long _head_1;         /* 头页信息 */
+    unsigned long _folio_dtor;     /* 析构函数指针 */
+    unsigned long _folio_order;    /* 页阶数 */
+    atomic_t _total_mapcount;      /* 总映射计数 */
+    atomic_t _pincount;           /* 固定计数 */
+};
+\end{lstlisting}
+
+这些字段前面其实已经见过了，这里让我们从复合页的角度重新审视。\texttt{\_folio\_dtor}为什么需要是个函数指针？因为不同类型的大页释放方式完全不同——透明大页可能要拆分回普通页，hugetlbfs页要归还到huge page池里。一个固定的释放逻辑搞不定。
+
+\texttt{\_folio\_order}告诉你这个folio有多大。order为2就是4个页面共16KB，order为9就是一个2MB的大页。在\texttt{struct page}时代，你得先找到头页，再从头页里挖出compound\_order。folio把这个信息直接放在结构体里，干净利落。\texttt{\_total\_mapcount}和\texttt{\_pincount}前面已经讲过，这里不重复了。
+
+\subsection{复合页操作函数}
+
+\begin{lstlisting}[language=C,caption={复合页操作API},label={lst:compound-operations}]
+/* 获取folio的页阶数 */
+static inline unsigned int folio_order(struct folio *folio)
+{
+    return folio->_folio_order;
+}
+
+/* 计算folio包含的页数 */
+static inline unsigned int folio_nr_pages(struct folio *folio)
+{
+    return 1U << folio_order(folio);
+}
+
+/* 获取folio的第一个页 */
+static inline struct page *folio_first_page(struct folio *folio)
+{
+    return &folio->page;
+}
+
+/* 获取folio的最后一个页 */
+static inline struct page *folio_last_page(struct folio *folio)
+{
+    return folio_first_page(folio) + folio_nr_pages(folio) - 1;
+}
+
+/* 遍历folio中的所有页 */
+#define folio_for_each_page(page, folio) \
+    for (page = folio_first_page(folio); \
+         page < folio_first_page(folio) + folio_nr_pages(folio); \
+         page++)
+\end{lstlisting}
+
+这几个函数都很直白，代码比解释更清楚。唯一值得说的是\texttt{folio\_nr\_pages}用位移而不是乘法——页面数总是2的幂，\texttt{1U << order}一条指令搞定。
+
+\texttt{folio\_for\_each\_page}宏在页面迁移的时候很常用：你需要逐个子页更新页表映射，没法整个folio一把搞。它就是个普通的for循环，指针从首页递增到末页，没有隐藏的魔法。
+
+\section{内存对齐和布局优化}
+
+\subsection{对齐要求}
+
+folio的数据结构设计充分考虑了内存对齐和性能优化：
+
+\begin{lstlisting}[language=C,caption={对齐检查},label={lst:alignment-check}]
+/* 验证folio结构的对齐要求 */
+static_assert(offsetof(struct folio, page) == 0);
+static_assert(sizeof(struct folio) == 64);  /* 64字节对齐 */
+static_assert(IS_ALIGNED(sizeof(struct folio), SMP_CACHE_BYTES));
+
+/* 确保folio字段与page字段的内存布局一致 */
+static_assert(offsetof(struct folio, flags) == 
+              offsetof(struct page, flags));
+static_assert(offsetof(struct folio, lru) == 
+              offsetof(struct page, lru));
+static_assert(offsetof(struct folio, mapping) == 
+              offsetof(struct page, mapping));
+\end{lstlisting}
+
+这些\texttt{static\_assert}看似不起眼，实际上是folio兼容性设计的安全网。第一条保证\texttt{page}成员在偏移量0——只有这样folio指针和page指针才能直接互转。第二条保证整个folio恰好64字节，也就是一条缓存行的大小。第三条换个方式再确认一遍缓存行对齐。
+
+后面三条更狠：逐个字段对比folio和page的偏移量，\texttt{flags}、\texttt{lru}、\texttt{mapping}必须完全一致。如果有人改了\texttt{struct page}的布局忘了同步folio，或者反过来，编译器直接拒绝编译。这比运行时发现数据莫名其妙被写坏然后debug三天强太多了。
+
+\subsection{缓存友好设计}
+
+folio的内存布局经过精心优化，以提高缓存命中率：
+
+\begin{lstlisting}[language=C,caption={缓存优化布局},label={lst:cache-optimization}]
+/*
+ * folio结构布局考虑了以下因素：
+ * 1. 频繁访问的字段放在前面
+ * 2. 相关字段尽量在同一个缓存行
+ * 3. 避免false sharing
+ * 4. 64字节对齐确保单独的缓存行
+ */
+
+struct folio_layout_analysis {
+    /* 热点字段 - 经常访问 */
+    unsigned long flags;        /* 频繁测试 */
+    struct list_head lru;       /* 频繁链表操作 */
+    atomic_t _refcount;         /* 频繁原子操作 */
+    
+    /* 温字段 - 偶尔访问 */
+    struct address_space *mapping;
+    pgoff_t index;
+    
+    /* 冷字段 - 很少访问 */
+    unsigned long _folio_order;
+    void *_folio_dtor;
+};
+\end{lstlisting}
+
+上述代码通过一个分析性的结构体\texttt{folio\_layout\_analysis}展示了folio字段按访问频率分层的设计思想。``热点字段''（\texttt{flags}、\texttt{lru}、\texttt{\_refcount}）是内核页面管理路径中被最频繁访问的字段——几乎每次页面操作都需要检查标志位、调整LRU位置或修改引用计数，因此它们被安排在结构体的最前面。``温字段''（\texttt{mapping}、\texttt{index}）在页缓存查找和文件I/O时使用，访问频率中等。``冷字段''（\texttt{\_folio\_order}、\texttt{\_folio\_dtor}）仅在特殊操作（如释放、分裂）时才需要读取。
+
+这种分层布局的意义在于缓存利用效率。当CPU访问folio的某个字段时，硬件会将包含该字段的整个缓存行（通常64字节）加载到L1缓存中。由于热点字段集中在前40字节内，一次缓存行加载就能满足大部分操作的需求，避免了额外的缓存未命中（cache miss）。注释中提到的``避免false sharing''同样重要：在多核系统中，如果两个CPU频繁修改同一缓存行中的不同字段，会导致缓存一致性协议（如MESI协议）频繁地在核间传递缓存行，严重降低性能。
+
+\section{深入剖析：folio的底层实现}
+
+在理解了folio的基本结构后，让我们深入到底层实现，分析编译器如何处理这些代码，以及为什么folio能带来性能提升。
+
+\subsection{内存布局的精确分析}
+
+folio和page的内存布局必须精确对齐。让我们通过实际的内存地址来理解这一点：
+
+\begin{lstlisting}[caption={folio与page的内存布局对比},label={lst:memory-layout-compare}]
+/*
+ * 假设一个folio对象在内存地址 0x1000
+ * 让我们看看每个字段的确切位置
+ */
+
+struct folio *folio = (struct folio *)0x1000;
+
+// 偏移量 0x00: flags (8 bytes on 64-bit)
+// 地址: 0x1000
+// 用途: 存储各种标志位 (PG_locked, PG_dirty, etc.)
+folio->flags
+
+// 偏移量 0x08: lru.next (8 bytes)
+// 地址: 0x1008
+// 用途: LRU链表的下一个节点
+folio->lru.next
+
+// 偏移量 0x10: lru.prev (8 bytes)
+// 地址: 0x1010
+// 用途: LRU链表的前一个节点
+folio->lru.prev
+
+// 偏移量 0x18: mapping (8 bytes)
+// 地址: 0x1018
+// 用途: 指向 address_space 结构
+folio->mapping
+
+// 偏移量 0x20: index (8 bytes)
+// 地址: 0x1020
+// 用途: 在address_space中的索引
+folio->index
+
+// 偏移量 0x28: private (8 bytes)
+// 地址: 0x1028
+// 用途: 私有数据指针
+folio->private
+
+// 偏移量 0x30: _mapcount (4 bytes)
+// 地址: 0x1030
+// 用途: 映射计数
+folio->_mapcount
+
+// 偏移量 0x34: _refcount (4 bytes)
+// 地址: 0x1034
+// 用途: 引用计数
+folio->_refcount
+
+/*
+ * 关键观察：
+ * 1. 前56字节与struct page完全相同
+ * 2. 每个字段都在缓存行边界对齐
+ * 3. 热点字段（flags, lru, _refcount）在前40字节内
+ * 4. 一个典型的64字节缓存行可以容纳所有热点字段
+ */
+
+// 验证对齐
+static_assert(sizeof(struct folio) % 64 == 0,
+             "folio must be cache-line aligned");
+static_assert(offsetof(struct folio, page) == 0,
+             "page must be at offset 0");
+\end{lstlisting}
+
+上述代码以假设地址\texttt{0x1000}为起点，逐字段列出了folio对象在内存中的精确布局。在64位系统上，\texttt{flags}占8字节位于偏移\texttt{0x00}；\texttt{lru}是一个\texttt{list\_head}包含两个指针共16字节，其中\texttt{next}在偏移\texttt{0x08}，\texttt{prev}在偏移\texttt{0x10}；\texttt{mapping}指针在偏移\texttt{0x18}；\texttt{index}在偏移\texttt{0x20}；\texttt{private}在偏移\texttt{0x28}；\texttt{\_mapcount}是4字节的\texttt{atomic\_t}在偏移\texttt{0x30}；紧随其后的\texttt{\_refcount}同为4字节在偏移\texttt{0x34}。这前56字节（偏移\texttt{0x00}到\texttt{0x37}）与\texttt{struct page}的布局完全相同。
+
+代码末尾的两个\texttt{static\_assert}从应用角度验证了这些布局假设。值得注意的是，folio总大小为64字节意味着一个folio对象恰好占据一条缓存行。这使得对folio的任何字段访问最多只触发一次缓存未命中，而不会跨缓存行导致两次加载。对于高频的内存管理操作而言，这个特性带来的性能收益是相当显著的。
+
+\subsection{汇编级别的性能分析}
+
+让我们看看编译器如何处理folio操作，以及为什么它比page操作更高效：
+
+\begin{lstlisting}[caption={folio访问的汇编代码分析},label={lst:assembly-analysis}]
+/*
+ * C 代码：获取folio的引用计数
+ */
+int get_folio_refcount(struct folio *folio)
+{
+    return atomic_read(&folio->_refcount);
+}
+
+/*
+ * 生成的x86-64汇编代码（GCC 11.2, -O2）：
+ *
+ * get_folio_refcount:
+ *     mov    0x34(%rdi), %eax    # 直接从偏移0x34读取_refcount
+ *     ret
+ *
+ * 指令数：2条
+ * 周期数：约1-2周期（假设缓存命中）
+ */
+
+/*
+ * 对比：获取page的引用计数（需要处理复合页）
+ */
+int get_page_refcount(struct page *page)
+{
+    page = compound_head(page);  // 可能需要额外跳转
+    return atomic_read(&page->_refcount);
+}
+
+/*
+ * 生成的x86-64汇编代码：
+ *
+ * get_page_refcount:
+ *     mov    (%rdi), %rax        # 读取compound_head字段
+ *     test   $0x1, %al           # 测试最低位
+ *     je     .L2                 # 如果是0，跳转到.L2
+ *     and    $-2, %rax           # 清除最低位，得到头页地址
+ *     mov    %rax, %rdi          # 更新page指针
+ * .L2:
+ *     mov    0x34(%rdi), %eax    # 读取_refcount
+ *     ret
+ *
+ * 指令数：6条（最坏情况）
+ * 周期数：约3-5周期（多一次内存访问）
+ *
+ * 性能差异：
+ * - folio: 2条指令，1次内存访问
+ * - page:  6条指令，可能2次内存访问
+ * - 性能提升：约50-60%
+ */
+\end{lstlisting}
+
+上述代码通过两个对比示例分析了folio与page在汇编级别的性能差异。\texttt{get\_folio\_refcount}直接通过folio指针以固定偏移量\texttt{0x34}读取引用计数，编译器生成的x86-64汇编仅需两条指令：一条\texttt{mov}指令从内存加载数据到寄存器，一条\texttt{ret}指令返回。整个操作在缓存命中的情况下仅需1到2个时钟周期。
+
+相比之下，\texttt{get\_page\_refcount}必须先调用\texttt{compound\_head}来处理复合页的情况。对于一个尾页（tail page），其第一个字段（通常存储的是compound\_head信息）的最低位为1，表示这是尾页而非头页。此时需要清除最低位得到头页地址，再从头页的\texttt{\_refcount}字段读取计数值。这一过程在最坏情况下需要6条指令，包括内存读取、位测试、条件跳转、位清除和指针更新。更关键的是可能涉及两次内存访问——第一次读取compound\_head字段，第二次读取实际的引用计数——如果它们不在同一个缓存行中，将导致额外的缓存未命中延迟。folio从设计上消除了这种间接查找的开销，因为folio指针总是指向头页，无需运行时判断。
+
+\subsection{原子操作的深入实现}
+
+folio的引用计数和映射计数使用原子操作。让我们详细分析这些操作：
+
+\begin{lstlisting}[caption={原子操作的实现细节},label={lst:atomic-impl}]
+/*
+ * folio引用计数的原子操作实现
+ */
+
+/* 获取folio引用 */
+static inline void folio_get(struct folio *folio)
+{
+    /*
+     * VM_BUG_ON：在调试模式下检查
+     * 生产环境编译时会被优化掉
+     */
+    VM_BUG_ON_FOLIO(folio_ref_count(folio) <= 0, folio);
+
+    /*
+     * atomic_inc 在x86-64上编译为：
+     * lock incl 0x34(%rdi)
+     *
+     * lock前缀确保操作的原子性：
+     * 1. 锁定内存总线
+     * 2. 增加计数
+     * 3. 释放总线
+     *
+     * 在现代CPU上使用缓存一致性协议（MESI）
+     * 性能开销约20-50个时钟周期
+     */
+    atomic_inc(&folio->_refcount);
+}
+
+/* 释放folio引用 */
+static inline void folio_put(struct folio *folio)
+{
+    /*
+     * atomic_dec_and_test 编译为：
+     * lock decl 0x34(%rdi)
+     * sete  %al
+     *
+     * 如果减到0，需要释放folio
+     */
+    if (atomic_dec_and_test(&folio->_refcount))
+        __folio_put(folio);
+}
+
+/*
+ * __folio_put 的完整实现
+ */
+void __folio_put(struct folio *folio)
+{
+    /*
+     * 释放folio的完整流程：
+     * 1. 从LRU链表移除
+     * 2. 从页缓存移除（如果有）
+     * 3. 调用析构函数
+     * 4. 返回给页分配器
+     */
+
+    /* 确保没有人在使用这个folio */
+    VM_BUG_ON_FOLIO(folio_ref_count(folio), folio);
+    VM_BUG_ON_FOLIO(folio_test_locked(folio), folio);
+
+    /* 从LRU移除 */
+    if (folio_test_lru(folio))
+        folio_del_lru(folio);
+
+    /* 从页缓存移除 */
+    if (folio_test_active(folio) || folio_test_unevictable(folio))
+        __clear_page_lru_flags(&folio->page);
+
+    /* 调用析构函数（如果有） */
+    if (folio->_folio_dtor) {
+        folio_dtor dtor = (folio_dtor)folio->_folio_dtor;
+        dtor(folio);
+    }
+
+    /* 释放内存 */
+    unsigned int order = folio_order(folio);
+    free_pages((unsigned long)folio, order);
+}
+
+/*
+ * 性能优化技巧：
+ *
+ * 1. 快速路径优化
+ *    对于引用计数>1的情况，atomic_dec不会触发__folio_put
+ *    这是最常见的情况，性能很好
+ *
+ * 2. 缓存行对齐
+ *    _refcount在独立的缓存行中，避免false sharing
+ *
+ * 3. 分支预测
+ *    likely/unlikely宏帮助CPU进行分支预测
+ */
+\end{lstlisting}
+
+上述代码详细展示了\texttt{folio\_get}、\texttt{folio\_put}和\texttt{\_\_folio\_put}的实现细节。\texttt{folio\_get}中的\texttt{VM\_BUG\_ON\_FOLIO}是调试专用的断言宏，在编译选项\texttt{CONFIG\_DEBUG\_VM}开启时会检查引用计数是否合法，在生产内核中则被编译器完全优化掉，零开销。\texttt{atomic\_inc}在x86-64上编译为\texttt{lock incl}指令，其中\texttt{lock}前缀通过MESI缓存一致性协议保证操作的原子性，开销约为20到50个时钟周期。
+
+\texttt{folio\_put}是释放引用的入口。\texttt{atomic\_dec\_and\_test}在x86-64上编译为\texttt{lock decl}加上\texttt{sete}指令，将递减和零值测试合并为一次原子操作。在绝大多数情况下（引用计数大于1），递减后不会触发释放路径，这是``快速路径''。只有当引用计数降至0时才进入慢速路径\texttt{\_\_folio\_put}。
+
+\texttt{\_\_folio\_put}执行完整的folio释放流程：首先通过断言确认引用计数确实为0且folio未被锁定；然后从LRU链表移除该folio；接着清除活跃或不可回收的LRU标志；如果folio注册了析构函数（\texttt{\_folio\_dtor}），则调用之执行类型特定的清理（如hugetlb页面的池化回收）；最后调用\texttt{free\_pages}将物理内存归还给伙伴分配器，参数\texttt{order}指定归还的连续页面数量为$2^{order}$。
+
+\subsection{引用计数机制的深度剖析}
+
+folio的引用计数机制比page更复杂，让我们详细分析：
+
+\begin{lstlisting}[caption={引用计数的完整机制},label={lst:refcount-mechanism}]
+/*
+ * folio的引用计数分为多个层次
+ */
+
+struct folio_refcount_analysis {
+    /*
+     * 层次1：页引用计数（_refcount）
+     * - 初始值：1（分配时）
+     * - 每次get增加
+     * - 每次put减少
+     * - 减到0时释放
+     */
+    atomic_t _refcount;
+
+    /*
+     * 层次2：映射计数（_mapcount）
+     * - 跟踪有多少页表项映射这个folio
+     * - 初始值：-1（未映射）
+     * - 每次页表映射增加
+     * - 用于判断是否可以回收
+     */
+    atomic_t _mapcount;
+
+    /*
+     * 层次3：总映射计数（_total_mapcount）
+     * - 只用于大folio
+     * - 汇总所有子页的映射
+     */
+    atomic_t _total_mapcount;
+
+    /*
+     * 层次4：固定计数（_pincount）
+     * - 用于防止页面迁移
+     * - DMA等场景使用
+     */
+    atomic_t _pincount;
+};
+
+/*
+ * 引用计数的状态转换
+ */
+void analyze_refcount_transitions(struct folio *folio)
+{
+    /*
+     * 状态1：新分配的folio
+     * _refcount = 1
+     * _mapcount = -1
+     * _total_mapcount = -1
+     * _pincount = 0
+     */
+
+    /*
+     * 操作：映射到进程地址空间
+     * page_add_file_rmap() 被调用
+     */
+    if (atomic_inc_and_test(&folio->_mapcount)) {
+        /* 从-1变为0，这是第一次映射 */
+        atomic_inc(&folio->_refcount);  // 增加引用计数
+    }
+    /*
+     * 状态2：已映射
+     * _refcount = 2
+     * _mapcount = 0
+     */
+
+    /*
+     * 操作：第二个进程映射（COW或共享）
+     */
+    atomic_inc(&folio->_mapcount);
+    /*
+     * 状态3：多个映射
+     * _refcount = 2
+     * _mapcount = 1
+     */
+
+    /*
+     * 操作：解除映射
+     */
+    if (atomic_add_negative(-1, &folio->_mapcount)) {
+        /* 映射计数变为-1，没有映射了 */
+        folio_put(folio);  // 减少引用计数
+    }
+    /*
+     * 状态4：回到未映射
+     * _refcount = 1
+     * _mapcount = -1
+     */
+
+    /*
+     * 操作：最后一次put
+     */
+    folio_put(folio);
+    /*
+     * 状态5：释放
+     * folio被返回给页分配器
+     */
+}
+
+/*
+ * 特殊情况：大folio的引用计数
+ */
+void large_folio_refcount(struct folio *folio)
+{
+    /*
+     * 对于order > 0的folio：
+     * 1. _refcount存储整个folio的引用
+     * 2. 不再有per-page的引用计数
+     * 3. _total_mapcount汇总所有映射
+     */
+
+    int nr_pages = folio_nr_pages(folio);
+
+    /*
+     * 检查folio是否可以回收
+     */
+    bool can_reclaim = folio_can_reclaim(folio);
+    /*
+     * 条件：
+     * 1. _refcount == 1（只有页缓存持有）
+     * 2. _total_mapcount == -1（没有进程映射）
+     * 3. 不在writeback状态
+     * 4. 不是脏页（或允许写回）
+     */
+}
+
+/*
+ * 调试和诊断
+ */
+void debug_folio_refcount(struct folio *folio)
+{
+    int refcount = folio_ref_count(folio);
+    int mapcount = folio_mapcount(folio);
+
+    pr_info("folio %p:\n", folio);
+    pr_info("  _refcount = %d\n", refcount);
+    pr_info("  _mapcount = %d\n", mapcount);
+
+    if (folio_test_large(folio)) {
+        int total_mapcount = atomic_read(&folio->_total_mapcount);
+        pr_info("  _total_mapcount = %d\n", total_mapcount);
+        pr_info("  nr_pages = %d\n", folio_nr_pages(folio));
+    }
+
+    if (refcount < 0 || refcount > 1000) {
+        pr_err("ERROR: Invalid refcount!\n");
+        dump_page(&folio->page, "refcount bug");
+    }
+}
+\end{lstlisting}
+
+上述代码全面分析了folio引用计数的多层次设计和状态转换过程。结构体\texttt{folio\_refcount\_analysis}概括了四个计数器的语义：\texttt{\_refcount}（初始为1）追踪通用引用，\texttt{\_mapcount}（初始为$-1$）追踪页表映射，\texttt{\_total\_mapcount}（仅用于大folio）汇总所有子页映射，\texttt{\_pincount}追踪DMA等场景下的固定请求。
+
+函数\texttt{analyze\_refcount\_transitions}演示了一个folio从分配到释放的完整生命周期中引用计数的变化。初始状态下\texttt{\_refcount}为1（由分配者持有），\texttt{\_mapcount}为$-1$（无映射）。当folio首次被映射到进程地址空间时，\texttt{\_mapcount}从$-1$递增到0，同时\texttt{\_refcount}递增到2以反映映射关系。后续映射仅递增\texttt{\_mapcount}而不影响\texttt{\_refcount}。解除映射时反向操作，最后一次解映射使\texttt{\_mapcount}回到$-1$并递减\texttt{\_refcount}。最终的\texttt{folio\_put}使\texttt{\_refcount}归零触发释放。
+
+\texttt{large\_folio\_refcount}函数强调了大folio在引用计数上的特殊性：整个folio共享一个\texttt{\_refcount}，不再维护per-page的引用计数，这大大简化了管理逻辑。\texttt{debug\_folio\_refcount}函数是调试辅助工具，输出folio的各项计数值，并对异常值（负数或超大值）进行告警。
+
+\subsection{锁机制的实现}
+
+folio的锁机制是内存管理中最关键的同步原语之一：
+
+\begin{lstlisting}[caption={folio锁机制的实现},label={lst:folio-lock}]
+/*
+ * folio锁使用flags字段的PG_locked位实现
+ * 这是一个位锁（bit lock），非常高效
+ */
+
+/* 获取folio锁 */
+void folio_lock(struct folio *folio)
+{
+    /*
+     * test_and_set_bit_lock 是原子操作
+     * 编译为：lock bts 指令
+     *
+     * 如果PG_locked位已经设置（锁被持有），
+     * 当前进程进入等待队列
+     */
+    might_sleep();  // 可能睡眠的标记，用于调试
+
+    if (!trylock_page(&folio->page))
+        __folio_lock(folio);
+}
+
+/* 锁的慢速路径 */
+void __folio_lock(struct folio *folio)
+{
+    /*
+     * 锁已被持有，需要等待
+     * 使用等待队列机制
+     */
+    struct wait_queue_head *wq;
+
+    /*
+     * 获取folio的等待队列
+     * 注意：等待队列不是per-folio的，而是hash的
+     * 多个folio可能共享同一个等待队列
+     */
+    wq = folio_waitqueue(folio);
+
+    /*
+     * 添加到等待队列并睡眠
+     * 当锁被释放时，会被唤醒
+     */
+    wait_on_bit_lock_io(&folio->flags, PG_locked,
+                        TASK_UNINTERRUPTIBLE);
+}
+
+/* 释放folio锁 */
+void folio_unlock(struct folio *folio)
+{
+    /*
+     * 清除PG_locked位
+     * 使用clear_bit_unlock确保内存屏障
+     */
+    VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+
+    clear_bit_unlock(PG_locked, &folio->flags);
+
+    /*
+     * 唤醒等待这个folio的进程
+     */
+    wake_up_page(&folio->page, PG_locked);
+}
+
+/* 尝试获取锁（非阻塞） */
+bool folio_trylock(struct folio *folio)
+{
+    /*
+     * 尝试设置PG_locked位
+     * 如果失败（已被持有），立即返回false
+     */
+    return trylock_page(&folio->page);
+}
+
+/*
+ * 等待队列的hash实现
+ */
+struct wait_queue_head *folio_waitqueue(struct folio *folio)
+{
+    /*
+     * 使用folio地址的hash值选择等待队列
+     * 这样可以减少等待队列的数量
+     *
+     * 典型配置：256个等待队列桶
+     */
+    const struct wait_bit_queue_entry *wq_entry;
+    unsigned long hash;
+
+    hash = hash_ptr(folio, 8);  // 取地址的低8位
+    return &folio_wait_table[hash];
+}
+
+/*
+ * 性能分析
+ */
+void analyze_lock_performance(void)
+{
+    /*
+     * 场景1：无竞争情况
+     * - folio_lock: 约5-10个时钟周期
+     * - 主要开销：atomic bit set
+     *
+     * 场景2：轻度竞争
+     * - 平均等待时间：10-100微秒
+     * - 取决于持有锁的操作复杂度
+     *
+     * 场景3：严重竞争
+     * - 可能导致性能问题
+     * - 需要考虑使用per-CPU页缓存
+     * - 或者增大预读窗口减少锁竞争
+     */
+}
+
+/*
+ * 锁的顺序规则
+ */
+void lock_ordering_rules(void)
+{
+    /*
+     * 规则1：总是按地址顺序获取多个folio的锁
+     * 防止死锁
+     */
+    if (folio1 < folio2) {
+        folio_lock(folio1);
+        folio_lock(folio2);
+    } else {
+        folio_lock(folio2);
+        folio_lock(folio1);
+    }
+
+    /*
+     * 规则2：不要在持有folio锁时获取其他类型的锁
+     * 特别是：
+     * - 不要获取mapping->i_pages锁
+     * - 不要获取LRU锁
+     *
+     * 正确的顺序：
+     * 1. mapping锁
+     * 2. LRU锁
+     * 3. folio锁
+     */
+}
+\end{lstlisting}
+
+上述代码详细展示了folio锁机制的完整实现。folio的锁复用了\texttt{flags}字段中的\texttt{PG\_locked}位，实现为一个``位锁''（bit lock）。\texttt{folio\_lock}是获取锁的入口：\texttt{might\_sleep}标记告知内核调试系统此处可能发生睡眠（用于检测在原子上下文中错误调用睡眠函数的bug），然后尝试\texttt{trylock\_page}进行非阻塞的加锁。如果锁已被持有，则进入慢速路径\texttt{\_\_folio\_lock}。
+
+慢速路径中，内核通过\texttt{folio\_waitqueue}获取该folio对应的等待队列。值得注意的是，等待队列不是每个folio独有的，而是通过对folio地址进行哈希来选择共享的等待队列桶（典型配置为256个桶）。这种设计避免了在每个folio中额外存储等待队列的开销。\texttt{wait\_on\_bit\_lock\_io}将当前进程放入等待队列并以\texttt{TASK\_UNINTERRUPTIBLE}状态睡眠，直到锁被释放时被唤醒。
+
+\texttt{folio\_unlock}释放锁时，先通过断言确认锁确实被当前持有，然后使用\texttt{clear\_bit\_unlock}清除\texttt{PG\_locked}位。此函数内含内存屏障（memory barrier），确保在清除锁位之前所有受锁保护的内存写操作都已对其他CPU可见。最后调用\texttt{wake\_up\_page}唤醒等待队列中的进程。代码末尾的\texttt{lock\_ordering\_rules}函数说明了两条重要的锁顺序规则：获取多个folio锁时必须按地址升序排列以防止死锁；获取不同类型锁时必须遵循mapping锁、LRU锁、folio锁的固定顺序。
+
+\section{实际应用示例}
+
+\subsection{文件读取中的folio使用}
+
+\begin{lstlisting}[language=C,caption={文件读取示例},label={lst:file-read-example}]
+static struct folio *filemap_get_folio(struct address_space *mapping,
+                                     pgoff_t index)
+{
+    struct folio *folio;
+    
+    /* 在页缓存中查找folio */
+    folio = filemap_get_folio_locked(mapping, index);
+    if (!folio)
+        return NULL;
+    
+    /* 检查folio状态 */
+    if (unlikely(folio_test_error(folio))) {
+        folio_unlock(folio);
+        folio_put(folio);
+        return ERR_PTR(-EIO);
+    }
+    
+    /* 如果folio未就绪，等待I/O完成 */
+    if (!folio_test_uptodate(folio)) {
+        folio_unlock(folio);
+        folio_wait_uptodate(folio);
+        folio_lock(folio);
+    }
+    
+    return folio;
+}
+
+/* 使用folio进行数据拷贝 */
+static int folio_copy_to_user(struct folio *folio, 
+                            char __user *buf, 
+                            unsigned long offset,
+                            unsigned long bytes)
+{
+    void *kaddr;
+    int ret;
+    
+    /* 映射folio到内核地址空间 */
+    kaddr = kmap_local_folio(folio, offset);
+    
+    /* 执行数据拷贝 */
+    if (copy_to_user(buf, kaddr, bytes))
+        ret = -EFAULT;
+    else
+        ret = 0;
+    
+    /* 取消映射 */
+    kunmap_local(kaddr);
+    
+    return ret;
+}
+\end{lstlisting}
+
+上述代码展示了folio在文件读取路径中的典型使用模式。\texttt{filemap\_get\_folio}函数从页缓存中获取一个可用的folio：首先调用\texttt{filemap\_get\_folio\_locked}在\texttt{address\_space}的基数树（xarray）中按索引\texttt{index}查找folio并加锁，如果未找到则返回\texttt{NULL}。找到后检查\texttt{FG\_error}标志，若存在I/O错误则解锁、释放引用并返回\texttt{ERR\_PTR(-EIO)}错误码。最后检查\texttt{FG\_uptodate}标志，如果folio的数据尚未从磁盘读入，则先解锁、等待I/O完成、再重新加锁，确保返回给调用者的folio包含最新数据。
+
+\texttt{folio\_copy\_to\_user}函数演示了如何将folio中的数据拷贝到用户空间。由于folio对应的物理页面可能不在内核的直接映射区（尤其在32位系统或高端内存区域），需要先调用\texttt{kmap\_local\_folio}建立临时的内核虚拟地址映射，参数\texttt{offset}指定在folio内的起始偏移。映射完成后调用\texttt{copy\_to\_user}执行实际的数据拷贝——这个函数会检查用户空间地址的合法性，拷贝失败时返回\texttt{-EFAULT}。最后通过\texttt{kunmap\_local}解除临时映射。这种``映射-使用-解映射''的模式是内核访问高端内存页面的标准范式。
+
+\subsection{网络数据包处理中的folio使用}
+
+\begin{lstlisting}[language=C,caption={网络folio处理示例},label={lst:network-folio-example}]
+struct sk_folio {
+    struct folio folio;
+    struct sk_buff *skb_list;    /* 相关联的skb链表 */
+    unsigned int offset;         /* 在folio中的偏移 */
+    unsigned int size;           /* 有效数据大小 */
+};
+
+/* 创建网络folio */
+struct sk_folio *sk_folio_alloc(unsigned int order)
+{
+    struct sk_folio *sk_folio;
+    struct folio *folio;
+    
+    /* 分配folio */
+    folio = alloc_folio(GFP_KERNEL, order);
+    if (!folio)
+        return NULL;
+    
+    /* 包装为sk_folio */
+    sk_folio = kmalloc(sizeof(*sk_folio), GFP_KERNEL);
+    if (!sk_folio) {
+        folio_put(folio);
+        return NULL;
+    }
+    
+    sk_folio->folio = *folio;
+    sk_folio->skb_list = NULL;
+    sk_folio->offset = 0;
+    sk_folio->size = 0;
+    
+    return sk_folio;
+}
+
+/* 释放网络folio */
+void sk_folio_free(struct sk_folio *sk_folio)
+{
+    struct sk_buff *skb, *next;
+    
+    /* 释放关联的skb */
+    for (skb = sk_folio->skb_list; skb; skb = next) {
+        next = skb->next;
+        kfree_skb(skb);
+    }
+    
+    /* 释放folio */
+    folio_put(&sk_folio->folio);
+    kfree(sk_folio);
+}
+\end{lstlisting}
+
+上述代码展示了一个将folio应用于网络子系统的概念性示例。\texttt{struct sk\_folio}在标准folio之上扩展了网络相关的字段：\texttt{skb\_list}指向与该folio关联的\texttt{sk\_buff}链表（\texttt{sk\_buff}是Linux网络栈中表示数据包的核心结构），\texttt{offset}和\texttt{size}分别记录有效数据在folio中的起始偏移和长度。
+
+\texttt{sk\_folio\_alloc}函数展示了分配流程：先通过\texttt{alloc\_folio}以指定的\texttt{order}分配一个folio（\texttt{GFP\_KERNEL}标志表示可以睡眠等待内存），再通过\texttt{kmalloc}分配包装结构。注意错误处理的严谨性——如果\texttt{kmalloc}失败，必须先调用\texttt{folio\_put}释放已分配的folio以避免内存泄漏。
+
+\texttt{sk\_folio\_free}函数执行释放操作：先遍历关联的\texttt{sk\_buff}链表，逐个调用\texttt{kfree\_skb}释放数据包缓冲区；然后调用\texttt{folio\_put}释放folio的引用（当引用计数归零时物理页面将被回收）；最后\texttt{kfree}释放\texttt{sk\_folio}结构体本身。这种``先释放关联资源、再释放主体''的顺序是内核资源管理的标准模式。
+
+\section{调试和诊断工具}
+
+\subsection{folio验证函数}
+
+内核提供了丰富的调试工具来验证folio的正确性：
+
+\begin{lstlisting}[language=C,caption={folio验证函数},label={lst:folio-validation}]
+/* 基本folio验证 */
+void folio_assert(struct folio *folio)
+{
+    VM_BUG_ON(!folio);
+    VM_BUG_ON(!atomic_read(&folio->_refcount));
+    VM_BUG_ON(folio_test_locked(folio) && 
+              !folio_test_owner(folio, current));
+}
+
+/* 详细的folio状态检查 */
+void folio_dump(struct folio *folio)
+{
+    pr_info("folio: %p\n", folio);
+    pr_info("  refcount: %d\n", atomic_read(&folio->_refcount));
+    pr_info("  mapcount: %d\n", atomic_read(&folio->_mapcount));
+    pr_info("  total_mapcount: %d\n", atomic_read(&folio->_total_mapcount));
+    pr_info("  flags: 0x%lx\n", folio->flags);
+    pr_info("  order: %lu\n", folio->_folio_order);
+    pr_info("  mapping: %p\n", folio->mapping);
+    pr_info("  index: %lu\n", folio->index);
+    
+    if (folio_test_compound(folio)) {
+        pr_info("  compound_order: %u\n", folio_order(folio));
+        pr_info("  nr_pages: %u\n", folio_nr_pages(folio));
+    }
+}
+\end{lstlisting}
+
+上述代码定义了两个folio调试辅助函数。\texttt{folio\_assert}执行基本的合法性检查：确认folio指针非空、引用计数大于0、以及如果folio处于锁定状态则持有者必须是当前进程。这些检查通过\texttt{VM\_BUG\_ON}宏实现，仅在启用\texttt{CONFIG\_DEBUG\_VM}编译选项的调试内核中生效，在生产环境中不产生任何运行时开销。
+
+\texttt{folio\_dump}函数提供了更详尽的状态转储功能，将folio的关键信息输出到内核日志中。它依次打印：folio的内核虚拟地址、引用计数、映射计数、总映射计数、标志位的十六进制原始值、folio阶数、所属的\texttt{address\_space}地址和页偏移索引。对于复合folio还额外输出阶数和包含的页面数。这个函数在排查内存管理问题时极为有用，开发者可以在可疑的代码路径中插入\texttt{folio\_dump}调用来观察folio的运行时状态。
+
+\subsection{性能监控工具}
+
+\begin{lstlisting}[language=C,caption={性能监控接口},label={lst:performance-monitoring}]
+/* folio相关统计信息 */
+struct folio_statistics {
+    unsigned long alloc_count;
+    unsigned long free_count;
+    unsigned long compound_alloc;
+    unsigned long compound_free;
+    unsigned long high_order_alloc;
+    unsigned long migration_success;
+    unsigned long migration_failure;
+};
+
+/* 导出统计信息到debugfs */
+static int folio_stats_show(struct seq_file *m, void *v)
+{
+    struct folio_statistics *stats = m->private;
+    
+    seq_printf(m, "Folio Statistics:\n");
+    seq_printf(m, "  Allocations: %lu\n", stats->alloc_count);
+    seq_printf(m, "  Frees: %lu\n", stats->free_count);
+    seq_printf(m, "  Compound allocations: %lu\n", stats->compound_alloc);
+    seq_printf(m, "  Compound frees: %lu\n", stats->compound_free);
+    seq_printf(m, "  High-order allocations: %lu\n", stats->high_order_alloc);
+    seq_printf(m, "  Successful migrations: %lu\n", stats->migration_success);
+    seq_printf(m, "  Failed migrations: %lu\n", stats->migration_failure);
+    
+    return 0;
+}
+\end{lstlisting}
+
+上述代码定义了folio性能监控的数据结构和debugfs导出接口。\texttt{struct folio\_statistics}汇总了七项关键指标：\texttt{alloc\_count}和\texttt{free\_count}分别记录folio的分配和释放总次数，它们的差值反映了当前在使用中的folio数量；\texttt{compound\_alloc}和\texttt{compound\_free}专门统计复合folio（order > 0）的分配和释放；\texttt{high\_order\_alloc}记录高阶分配的次数，高阶分配失败率是系统内存碎片化程度的重要指标；\texttt{migration\_success}和\texttt{migration\_failure}统计folio迁移的成败，迁移是NUMA负载均衡和内存规整（compaction）的核心操作。
+
+\texttt{folio\_stats\_show}函数是debugfs文件的\texttt{show}回调，通过\texttt{seq\_printf}将统计信息格式化输出。系统管理员可以通过读取\texttt{/sys/kernel/debug/}下的对应文件来获取这些运行时统计数据，用于性能调优和问题诊断。例如，如果\texttt{migration\_failure}占比过高，可能意味着系统存在严重的内存碎片化问题，需要调整\texttt{/proc/sys/vm/compact\_memory}等参数来触发主动的内存规整。
+
+\section{总结}
+
+本章详细剖析了folio的核心数据结构，从基础定义到高级特性的实现。folio的设计体现了内核开发者的深厚功底和前瞻性思考：
+
+\begin{itemize}
+    \item \textbf{兼容性设计}: 通过union结构保持与\texttt{struct page}的完全兼容
+    \item \textbf{类型安全}: 内建的类型检查减少了运行时错误
+    \item \textbf{功能扩展}: 丰富的新字段提供了原有page不具备的功能
+    \item \textbf{性能优化}: 64字节对齐和缓存友好的布局设计
+    \item \textbf{调试支持}: 完善的验证和监控工具
+\end{itemize}
+
+下一章将探讨folio与页缓存的具体结合应用。
+
+
+\end{document}

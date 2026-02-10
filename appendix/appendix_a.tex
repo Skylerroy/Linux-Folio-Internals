@@ -1,0 +1,378 @@
+\documentclass[../main.tex]{subfiles}
+\begin{document}
+\chapter{folio API参考手册}
+\label{appendix:api-reference}
+
+\section{核心folio操作函数}
+
+\subsection{folio分配和释放}
+
+\begin{functiondesc}{alloc\_folio}{gfp\_t gfp, unsigned int order}
+分配一个新的folio对象。
+
+\param{gfp}{内存分配标志，如GFP\_KERNEL, GFP\_ATOMIC等}
+\param{order}{页阶数，0表示单页，1表示2页，2表示4页等}
+\returns{成功时返回folio指针，失败时返回NULL}
+
+\begin{lstlisting}[language=C]
+struct folio *folio = alloc_folio(GFP_KERNEL, 2);  /* 分配4页的folio */
+if (!folio) {
+    /* 处理分配失败 */
+    return -ENOMEM;
+}
+\end{lstlisting}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_get}{struct folio *folio}
+增加folio的引用计数。
+
+\param{folio}{要增加引用计数的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_put}{struct folio *folio}
+减少folio的引用计数，当引用计数归零时释放folio。
+
+\param{folio}{要减少引用计数的folio}
+\end{functiondesc}
+
+\subsection{folio状态查询和设置}
+
+\begin{functiondesc}{folio\_test\_uptodate}{struct folio *folio}
+检查folio是否标记为最新的。
+
+\param{folio}{要检查的folio}
+\returns{如果是最新状态返回true，否则返回false}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_set\_uptodate}{struct folio *folio}
+将folio标记为最新的。
+
+\param{folio}{要设置的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_clear\_uptodate}{struct folio *folio}
+清除folio的最新标记。
+
+\param{folio}{要清除标记的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_test\_dirty}{struct folio *folio}
+检查folio是否为脏页。
+
+\param{folio}{要检查的folio}
+\returns{如果是脏页返回true，否则返回false}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_mark\_dirty}{struct folio *folio}
+将folio标记为脏页。
+
+\param{folio}{要标记的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_clear\_dirty}{struct folio *folio}
+清除folio的脏页标记。
+
+\param{folio}{要清除标记的folio}
+\end{functiondesc}
+
+\subsection{folio锁定操作}
+
+\begin{functiondesc}{folio\_lock}{struct folio *folio}
+锁定folio，防止并发访问。
+
+\param{folio}{要锁定的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_unlock}{struct folio *folio}
+解锁folio。
+
+\param{folio}{要解锁的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_trylock}{struct folio *folio}
+尝试锁定folio，不会阻塞。
+
+\param{folio}{要尝试锁定的folio}
+\returns{成功锁定返回true，否则返回false}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_lock\_killable}{struct folio *folio}
+可被信号中断的folio锁定。
+
+\param{folio}{要锁定的folio}
+\returns{成功返回0，被信号中断返回-EINTR}
+\end{functiondesc}
+
+\subsection{folio数据访问}
+
+\begin{functiondesc}{folio\_address}{struct folio *folio}
+获取folio的内核虚拟地址。
+
+\param{folio}{要获取地址的folio}
+\returns{folio的内核虚拟地址}
+\end{functiondesc}
+
+\begin{functiondesc}{kmap\_local\_folio}{struct folio *folio, unsigned long offset}
+映射folio到本地CPU的内核地址空间。
+
+\param{folio}{要映射的folio}
+\param{offset}{folio内的偏移量}
+\returns{映射后的内核地址}
+\end{functiondesc}
+
+\begin{functiondesc}{kunmap\_local}{void *addr}
+取消本地folio映射。
+
+\param{addr}{之前映射返回的地址}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_copy\_to\_iter}{struct folio *folio, size\_t offset, size\_t bytes, struct iov\_iter *i}
+将folio数据拷贝到iov\_iter。
+
+\param{folio}{源folio}
+\param{offset}{folio内起始偏移}
+\param{bytes}{要拷贝的字节数}
+\param{i}{目标iov\_iter}
+\returns{实际拷贝的字节数}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_copy\_from\_iter}{struct folio *folio, size\_t offset, size\_t bytes, struct iov\_iter *i}
+从iov\_iter拷贝数据到folio。
+
+\param{folio}{目标folio}
+\param{offset}{folio内起始偏移}
+\param{bytes}{要拷贝的字节数}
+\param{i}{源iov\_iter}
+\returns{实际拷贝的字节数}
+\end{functiondesc}
+
+\section{复合folio操作}
+
+\subsection{复合folio属性查询}
+
+\begin{functiondesc}{folio\_test\_compound}{struct folio *folio}
+检查folio是否为复合folio。
+
+\param{folio}{要检查的folio}
+\returns{如果是复合folio返回true，否则返回false}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_order}{struct folio *folio}
+获取folio的阶数。
+
+\param{folio}{要查询的folio}
+\returns{folio的阶数}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_nr\_pages}{struct folio *folio}
+获取folio包含的页数。
+
+\param{folio}{要查询的folio}
+\returns{folio包含的页数}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_size}{struct folio *folio}
+获取folio的总大小（字节数）。
+
+\param{folio}{要查询的folio}
+\returns{folio的总大小}
+\end{functiondesc}
+
+\subsection{复合folio遍历}
+
+\begin{functiondesc}{folio\_first\_page}{struct folio *folio}
+获取folio的第一个页。
+
+\param{folio}{要查询的folio}
+\returns{folio的第一个页}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_last\_page}{struct folio *folio}
+获取folio的最后一个页。
+
+\param{folio}{要查询的folio}
+\returns{folio的最后一个页}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_for\_each\_page}{page, folio}
+遍历folio中的所有页。
+
+\param{page}{循环变量}
+\param{folio}{要遍历的folio}
+
+\begin{lstlisting}[language=C]
+struct page *page;
+struct folio *folio = get_some_folio();
+
+folio_for_each_page(page, folio) {
+    /* 处理每个页 */
+    process_page(page);
+}
+\end{lstlisting}
+\end{functiondesc}
+
+\section{页缓存操作}
+
+\subsection{页缓存查找和插入}
+
+\begin{functiondesc}{filemap\_get\_folio}{struct address\_space *mapping, pgoff\_t index}
+在页缓存中查找指定索引的folio。
+
+\param{mapping}{地址空间}
+\param{index}{页索引}
+\returns{找到的folio指针，未找到返回NULL}
+\end{functiondesc}
+
+\begin{functiondesc}{filemap\_insert\_folio}{struct address\_space *mapping, struct folio *folio, pgoff\_t index}
+将folio插入到页缓存。
+
+\param{mapping}{地址空间}
+\param{folio}{要插入的folio}
+\param{index}{页索引}
+\returns{成功返回0，失败返回错误码}
+\end{functiondesc}
+
+\begin{functiondesc}{filemap\_remove\_folio}{struct folio *folio}
+从页缓存中移除folio。
+
+\param{folio}{要移除的folio}
+\end{functiondesc}
+
+\subsection{页缓存管理}
+
+\begin{functiondesc}{folio\_add\_lru}{struct folio *folio}
+将folio添加到LRU链表。
+
+\param{folio}{要添加的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_del\_lru}{struct folio *folio}
+将folio从LRU链表中删除。
+
+\param{folio}{要删除的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_activate}{struct folio *folio}
+激活folio（移动到活跃LRU链表）。
+
+\param{folio}{要激活的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_deactivate}{struct folio *folio}
+停用folio（移动到非活跃LRU链表）。
+
+\param{folio}{要停用的folio}
+\end{functiondesc}
+
+\section{类型转换函数}
+
+\subsection{folio与page转换}
+
+\begin{functiondesc}{page\_folio}{struct page *page}
+将page指针转换为folio指针。
+
+\param{page}{要转换的page}
+\returns{对应的folio指针}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_page}{struct folio *folio, unsigned int n}
+获取folio中的第n个页。
+
+\param{folio}{源folio}
+\param{n}{页索引（从0开始）}
+\returns{第n个页的指针}
+\end{functiondesc}
+
+\begin{functiondesc}{page\_is\_folio\_head}{struct page *page}
+检查page是否是folio的头页。
+
+\param{page}{要检查的page}
+\returns{如果是头页返回true，否则返回false}
+\end{functiondesc}
+
+\section{调试和诊断函数}
+
+\subsection{folio验证}
+
+\begin{functiondesc}{folio\_assert}{struct folio *folio}
+验证folio的基本属性。
+
+\param{folio}{要验证的folio}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_dump}{struct folio *folio}
+转储folio的详细信息。
+
+\param{folio}{要转储的folio}
+\end{functiondesc}
+
+\subsection{统计信息}
+
+\begin{functiondesc}{folio\_stat\_incr}{enum folio\_stat\_item item, unsigned long count}
+增加folio统计计数。
+
+\param{item}{统计项目}
+\param{count}{增加的数量}
+\end{functiondesc}
+
+\begin{functiondesc}{folio\_stat\_decr}{enum folio\_stat\_item item, unsigned long count}
+减少folio统计计数。
+
+\param{item}{统计项目}
+\param{count}{减少的数量}
+\end{functiondesc}
+
+\section{错误处理}
+
+\subsection{常见错误码}
+
+\begin{table}[htbp]
+\centering
+\caption{folio操作常见错误码}
+\label{tab:folio-error-codes}
+\begin{tabular}{|l|l|p{6cm}|}
+\hline
+\textbf{错误码} & \textbf{数值} & \textbf{含义} \\
+\hline
+ENOMEM & -12 & 内存分配失败 \\
+EINTR & -4 & 操作被信号中断 \\
+EINVAL & -22 & 无效参数 \\
+EIO & -5 & I/O错误 \\
+EBUSY & -16 & 资源忙 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{错误处理最佳实践}
+
+\begin{lstlisting}[language=C,caption={错误处理示例}]
+static int safe_folio_operation(struct folio *folio)
+{
+    int ret;
+    
+    /* 参数验证 */
+    if (!folio)
+        return -EINVAL;
+    
+    /* 锁定folio */
+    if (folio_lock_killable(folio))
+        return -EINTR;
+    
+    /* 执行操作 */
+    ret = do_folio_operation(folio);
+    if (ret) {
+        pr_err("Folio operation failed: %d\n", ret);
+        goto unlock;
+    }
+    
+    /* 标记folio状态 */
+    folio_mark_dirty(folio);
+    
+unlock:
+    folio_unlock(folio);
+    return ret;
+}
+\end{lstlisting}
+
+
+\end{document}

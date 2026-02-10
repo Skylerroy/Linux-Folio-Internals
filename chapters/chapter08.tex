@@ -1,0 +1,2998 @@
+\documentclass[../main.tex]{subfiles}
+\begin{document}
+% 第8章 实践与迁移指南
+\chapter{实践与迁移指南}
+\label{chap:migration}
+
+\begin{epigraph}
+\textit{``The best code migration is the one that nobody notices because it just works.''}
+\begin{flushright}
+--- 内核开发最佳实践
+\end{flushright}
+\end{epigraph}
+
+\section{引言}
+
+前面的章节详细介绍了 folio 的概念、实现和演进历史。本章将聚焦于实践，为内核开发者提供一份全面的 folio 迁移指南。无论你是在维护现有代码，还是开发新的文件系统或驱动程序，本章的内容都将帮助你正确、高效地使用 folio。
+
+本章的内容组织如下：
+
+\begin{itemize}
+    \item 首先，我们讨论何时应该使用 folio
+    \item 然后，详细介绍从 page 到 folio 的代码迁移方法
+    \item 接着，提供一份完整的 folio API 速查表
+    \item 之后，分析常见的错误和陷阱
+    \item 最后，通过实际案例展示迁移过程
+\end{itemize}
+
+\section{何时应该使用 folio}
+
+\subsection{使用 folio 的场景}
+
+\subsubsection{必须使用 folio 的场景}
+
+\begin{enumerate}
+    \item \textbf{实现新的 address\_space\_operations}：Linux 6.0 及以后版本，新代码应该使用 \texttt{read\_folio} 而非废弃的 \texttt{readpage}。
+    
+    \item \textbf{处理页缓存}：任何与 \texttt{address\_space} 交互的代码都应优先使用 folio API。
+    
+    \item \textbf{处理复合页}：如果你的代码需要处理可能是复合页的内存，使用 folio 可以避免很多 bug。
+    
+    \item \textbf{新的文件系统实现}：所有新文件系统都应该从一开始就使用 folio。
+\end{enumerate}
+
+\begin{lstlisting}[language=C,caption={必须使用 folio 的典型场景},label={lst:must-use-folio}]
+/*
+ * 场景1：实现 address_space_operations
+ * 新代码必须使用 read_folio，不应使用 readpage
+ */
+const struct address_space_operations my_aops = {
+    .read_folio         = my_read_folio,     /* 正确：使用 folio */
+    /* .readpage        = my_readpage, */    /* 错误：已废弃 */
+    .writepages         = my_writepages,
+    .dirty_folio        = my_dirty_folio,    /* 正确：使用 folio */
+    /* .set_page_dirty  = my_set_page_dirty, */ /* 错误：已废弃 */
+    .release_folio      = my_release_folio,
+    .invalidate_folio   = my_invalidate_folio,
+};
+
+/*
+ * 场景2：页缓存操作
+ * 应该使用 folio API
+ */
+static struct folio *my_find_or_create_folio(struct address_space *mapping,
+                                              pgoff_t index)
+{
+    /* 正确：使用 folio API */
+    return __filemap_get_folio(mapping, index, 
+                                FGP_LOCK | FGP_CREAT, GFP_KERNEL);
+    
+    /* 不推荐：使用旧的 page API */
+    /* return find_or_create_page(mapping, index, GFP_KERNEL); */
+}
+
+/*
+ * 场景3：处理可能是复合页的内存
+ */
+static void process_memory_region(struct page *page)
+{
+    /* 正确：转换为 folio 后处理 */
+    struct folio *folio = page_folio(page);
+    size_t size = folio_size(folio);
+    /* 使用 folio API 操作 */
+    
+    /* 不推荐：直接操作 page，可能遇到复合页问题 */
+    /* unsigned long size = PAGE_SIZE; */  /* 如果是复合页这是错的！ */
+}
+\end{lstlisting}
+
+上述代码展示了三种必须使用 folio API 的典型场景。场景 1 中，\texttt{address\_space\_operations} 结构体使用了新的 folio 回调：\texttt{.read\_folio} 替代已废弃的 \texttt{.readpage}，\texttt{.dirty\_folio} 替代已废弃的 \texttt{.set\_page\_dirty}，\texttt{.release\_folio} 和 \texttt{.invalidate\_folio} 处理 folio 的释放和失效逻辑。在 Linux 6.0 及以后的版本中，新实现的文件系统必须使用这些新回调，内核已经不再推荐注册旧式的 \texttt{readpage} 和 \texttt{set\_page\_dirty} 回调。
+
+场景 2 中，\texttt{my\_find\_or\_create\_folio} 函数使用 \texttt{\_\_filemap\_get\_folio} 在页缓存中查找或创建 folio。\texttt{FGP\_LOCK} 标志表示返回时 folio 已被锁定，\texttt{FGP\_CREAT} 标志表示如果 folio 不存在则创建一个新的，\texttt{GFP\_KERNEL} 是内存分配标志。这个函数替代了旧的 \texttt{find\_or\_create\_page} 接口。场景 3 中，\texttt{process\_memory\_region} 函数接收一个可能是复合页尾页的 \texttt{struct page *}，通过 \texttt{page\_folio(page)} 转换为 folio 后使用 \texttt{folio\_size(folio)} 获取完整的大小。如果不做这个转换而直接使用 \texttt{PAGE\_SIZE}，当 page 是复合页的一部分时，获得的大小就是错误的，仅代表一个子页的大小而非整个分配单元的大小。
+
+\subsubsection{推荐使用 folio 的场景}
+
+\begin{enumerate}
+    \item \textbf{维护现有代码}：在修改现有代码时，可以顺便将 page API 迁移到 folio。
+    
+    \item \textbf{需要清晰表达意图}：当你希望代码明确表示``这是一个完整的分配单元''时。
+    
+    \item \textbf{性能敏感的路径}：folio 可以帮助编译器进行更好的优化。
+\end{enumerate}
+
+\subsubsection{可以继续使用 page 的场景}
+
+\begin{enumerate}
+    \item \textbf{低层内存分配}：直接与伙伴系统交互时，通常仍使用 page。
+    
+    \item \textbf{页表操作}：页表条目指向的是 page，不是 folio。
+    
+    \item \textbf{与硬件交互}：DMA 等需要物理地址的场景。
+    
+    \item \textbf{slab 分配器}：slab 内部使用自己的抽象。
+\end{enumerate}
+
+\begin{lstlisting}[language=C,caption={仍然使用 page 的场景},label={lst:still-use-page}]
+/*
+ * 场景1：低层内存分配
+ * 伙伴系统返回 page
+ */
+static struct page *allocate_pages(unsigned int order)
+{
+    /* 伙伴系统仍然使用 page */
+    return alloc_pages(GFP_KERNEL, order);
+}
+
+/*
+ * 场景2：页表操作
+ * 页表条目指向 page
+ */
+static int setup_page_table_entry(pte_t *pte, struct page *page)
+{
+    pte_t entry = mk_pte(page, PAGE_KERNEL);
+    set_pte(pte, entry);
+    return 0;
+}
+
+/*
+ * 场景3：DMA 操作
+ * 需要物理地址
+ */
+static dma_addr_t setup_dma(struct device *dev, struct page *page)
+{
+    return dma_map_page(dev, page, 0, PAGE_SIZE, DMA_TO_DEVICE);
+}
+\end{lstlisting}
+
+上述代码展示了三种仍然适合使用 page API 的典型场景。第一个场景是低层内存分配：\texttt{alloc\_pages} 是伙伴系统（buddy allocator）的核心接口，它直接返回 \texttt{struct page *}。伙伴系统管理的是物理页帧，它的分配粒度和数据结构都围绕 \texttt{struct page} 设计，目前没有迁移到 folio 的计划（虽然可以用 \texttt{folio\_alloc} 作为封装，但底层仍然是 page）。
+
+第二个场景是页表操作：\texttt{mk\_pte} 和 \texttt{set\_pte} 函数将 page 与页表项（PTE）关联。页表的每个条目映射一个物理页帧，这是硬件定义的粒度，与 folio 的``逻辑分配单元''概念不同。即使一个大 folio 包含多个 page，页表仍然需要为每个 page 创建独立的映射条目（除非使用 huge page 映射）。第三个场景是 DMA 操作：\texttt{dma\_map\_page} 需要精确的物理页地址和偏移来设置 DMA 传输，硬件 DMA 引擎直接操作物理地址，不理解 folio 的抽象概念。这三类场景的共同特点是它们直接与硬件或底层内存管理机制交互，处于 folio 抽象层之下。
+
+\subsection{决策流程图}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=2cm,
+    decision/.style={diamond, draw, fill=yellow!20, text width=4cm, 
+                     text badly centered, inner sep=2pt},
+    block/.style={rectangle, draw, fill=blue!20, text width=4cm, 
+                  text centered, rounded corners, minimum height=1cm},
+    line/.style={draw, -latex'},
+]
+
+\node [block] (start) {开始：需要处理内存};
+\node [decision, below of=start, yshift=-1cm] (q1) {是否与页缓存交互？};
+\node [decision, below of=q1, yshift=-1.5cm] (q2) {是否处理复合页？};
+\node [decision, below of=q2, yshift=-1.5cm] (q3) {是否是新代码？};
+\node [block, right of=q1, xshift=4cm] (use_folio) {使用 folio API};
+\node [block, right of=q3, xshift=4cm] (use_page) {可以使用 page API};
+\node [decision, below of=q3, yshift=-1.5cm] (q4) {是否在重构代码？};
+
+\path [line] (start) -- (q1);
+\path [line] (q1) -- node[left] {否} (q2);
+\path [line] (q1) -- node[above] {是} (use_folio);
+\path [line] (q2) -- node[left] {否} (q3);
+\path [line] (q2) -- node[above] {是} (use_folio);
+\path [line] (q3) -- node[above] {是} (use_folio);
+\path [line] (q3) -- node[left] {否} (q4);
+\path [line] (q4) -- node[above] {是} (use_folio);
+\path [line] (q4) -- node[above] {否} (use_page);
+
+\end{tikzpicture}
+\caption{folio vs page 决策流程}
+\label{fig:decision-flow}
+\end{figure}
+
+\section{从 page 到 folio 的代码迁移}
+
+\subsection{常见的迁移模式}
+
+\subsubsection{模式1：简单的 API 替换}
+
+这是最常见的迁移模式，直接将 page API 替换为对应的 folio API：
+
+\begin{lstlisting}[language=C,caption={简单 API 替换示例},label={lst:simple-replace}]
+/*
+ * 迁移前：使用 page API
+ */
+void old_function(struct page *page)
+{
+    lock_page(page);
+    
+    if (PageDirty(page)) {
+        ClearPageDirty(page);
+        /* 处理脏页 */
+    }
+    
+    SetPageUptodate(page);
+    unlock_page(page);
+    
+    put_page(page);
+}
+
+/*
+ * 迁移后：使用 folio API
+ */
+void new_function(struct page *page)
+{
+    struct folio *folio = page_folio(page);
+    
+    folio_lock(folio);
+    
+    if (folio_test_dirty(folio)) {
+        folio_clear_dirty(folio);
+        /* 处理脏 folio */
+    }
+    
+    folio_mark_uptodate(folio);
+    folio_unlock(folio);
+    
+    folio_put(folio);
+}
+
+/*
+ * 最佳实践：直接接收 folio
+ */
+void best_function(struct folio *folio)
+{
+    folio_lock(folio);
+    
+    if (folio_test_dirty(folio)) {
+        folio_clear_dirty(folio);
+        /* 处理脏 folio */
+    }
+    
+    folio_mark_uptodate(folio);
+    folio_unlock(folio);
+    
+    folio_put(folio);
+}
+\end{lstlisting}
+
+上述代码展示了最常见的 folio 迁移模式——直接 API 替换。代码给出了三个版本：\texttt{old\_function} 使用传统的 page API，\texttt{new\_function} 和 \texttt{best\_function} 使用 folio API。核心替换对应关系为：\texttt{lock\_page(page)} 替换为 \texttt{folio\_lock(folio)}；\texttt{PageDirty(page)} 替换为 \texttt{folio\_test\_dirty(folio)}；\texttt{ClearPageDirty(page)} 替换为 \texttt{folio\_clear\_dirty(folio)}；\texttt{SetPageUptodate(page)} 替换为 \texttt{folio\_mark\_uptodate(folio)}；\texttt{unlock\_page(page)} 替换为 \texttt{folio\_unlock(folio)}；\texttt{put\_page(page)} 替换为 \texttt{folio\_put(folio)}。
+
+\texttt{new\_function} 和 \texttt{best\_function} 的区别在于参数类型：前者仍然接收 \texttt{struct page *}，内部通过 \texttt{page\_folio(page)} 转换获得 folio；后者直接接收 \texttt{struct folio *}，避免了转换开销。在实际迁移中，如果调用者也在同步迁移，应优先采用 \texttt{best\_function} 的方式，让整个调用链都使用 folio 类型。如果调用者暂时无法修改，则采用 \texttt{new\_function} 的方式作为过渡。\texttt{page\_folio} 函数实质上等价于 \texttt{compound\_head}，它确保返回的是复合页的首页（head page），这样所有的标志位操作和引用计数操作都作用在正确的位置。
+
+\subsubsection{模式2：处理大小变化}
+
+当代码涉及内存大小计算时，需要特别注意 folio 可能比单个 page 大：
+
+\begin{lstlisting}[language=C,caption={处理大小变化的迁移},label={lst:size-migration}]
+/*
+ * 迁移前：假设大小是 PAGE_SIZE
+ */
+void old_copy_function(struct page *page, void *buf)
+{
+    void *addr = kmap_local_page(page);
+    memcpy(buf, addr, PAGE_SIZE);  /* 硬编码 PAGE_SIZE */
+    kunmap_local(addr);
+}
+
+/*
+ * 迁移后：使用 folio 的实际大小
+ */
+void new_copy_function(struct folio *folio, void *buf)
+{
+    void *addr = kmap_local_folio(folio, 0);
+    size_t size = folio_size(folio);  /* 使用实际大小 */
+    memcpy(buf, addr, size);
+    kunmap_local(addr);
+}
+
+/*
+ * 如果需要处理 folio 中的特定页
+ */
+void copy_specific_page(struct folio *folio, size_t page_index, void *buf)
+{
+    void *addr;
+    
+    /* 确保索引有效 */
+    if (page_index >= folio_nr_pages(folio))
+        return;
+    
+    /* 映射特定偏移 */
+    addr = kmap_local_folio(folio, page_index * PAGE_SIZE);
+    memcpy(buf, addr, PAGE_SIZE);
+    kunmap_local(addr);
+}
+\end{lstlisting}
+
+上述代码展示了当代码涉及内存大小计算时的迁移方法。\texttt{old\_copy\_function} 使用 \texttt{kmap\_local\_page} 映射单个 page 并硬编码 \texttt{PAGE\_SIZE} 作为拷贝长度。迁移后的 \texttt{new\_copy\_function} 使用 \texttt{kmap\_local\_folio(folio, 0)} 映射 folio（第二个参数 0 表示从 folio 起始偏移映射），并通过 \texttt{folio\_size(folio)} 获取实际大小。这确保了无论 folio 是单页还是大 folio，都能正确处理全部数据。
+
+\texttt{copy\_specific\_page} 函数展示了更精细的操作：当需要访问大 folio 中的某个特定页面时，先通过 \texttt{folio\_nr\_pages(folio)} 检查索引是否越界，然后使用 \texttt{kmap\_local\_folio(folio, page\_index * PAGE\_SIZE)} 映射指定偏移位置的一个页面。这种模式在文件系统中很常见，例如只需要更新 folio 中某一个页面的数据时，无需映射整个 folio。需要注意的是，\texttt{kmap\_local\_folio} 返回的映射是临时的，必须通过 \texttt{kunmap\_local} 释放，且在持有映射期间不能睡眠或切换到其他任务。
+
+\subsubsection{模式3：address\_space\_operations 迁移}
+
+文件系统迁移的核心是 \texttt{address\_space\_operations}：
+
+\begin{lstlisting}[language=C,caption={address\_space\_operations 迁移},label={lst:aops-migration}]
+/*
+ * 迁移前：旧式 readpage
+ */
+static int old_readpage(struct file *file, struct page *page)
+{
+    struct inode *inode = page->mapping->host;
+    loff_t pos = page_offset(page);
+    int ret;
+    
+    ret = do_read_data(inode, page, pos, PAGE_SIZE);
+    
+    if (ret == 0) {
+        SetPageUptodate(page);
+    } else {
+        SetPageError(page);
+    }
+    
+    unlock_page(page);
+    return ret;
+}
+
+/*
+ * 迁移后：新式 read_folio
+ */
+static int new_read_folio(struct file *file, struct folio *folio)
+{
+    struct inode *inode = folio->mapping->host;
+    loff_t pos = folio_pos(folio);
+    size_t len = folio_size(folio);
+    int ret;
+    
+    ret = do_read_data_folio(inode, folio, pos, len);
+    
+    if (ret == 0) {
+        folio_mark_uptodate(folio);
+    } else {
+        folio_set_error(folio);
+    }
+    
+    folio_unlock(folio);
+    return ret;
+}
+
+/*
+ * 迁移前：set_page_dirty
+ */
+static int old_set_page_dirty(struct page *page)
+{
+    /* ... */
+    return __set_page_dirty_nobuffers(page);
+}
+
+/*
+ * 迁移后：dirty_folio
+ */
+static bool new_dirty_folio(struct address_space *mapping,
+                            struct folio *folio)
+{
+    /* ... */
+    return filemap_dirty_folio(mapping, folio);
+}
+
+/*
+ * 完整的迁移后 address_space_operations
+ */
+const struct address_space_operations new_aops = {
+    /* 核心读取操作 */
+    .read_folio         = new_read_folio,
+    .readahead          = new_readahead,
+    
+    /* 写入操作 */
+    .writepages         = new_writepages,
+    .write_begin        = new_write_begin,
+    .write_end          = new_write_end,
+    
+    /* folio 状态操作 */
+    .dirty_folio        = new_dirty_folio,
+    .release_folio      = new_release_folio,
+    .invalidate_folio   = new_invalidate_folio,
+    .migrate_folio      = new_migrate_folio,
+    
+    /* 其他操作 */
+    .bmap               = new_bmap,
+    .direct_IO          = noop_direct_IO,
+    .swap_activate      = new_swap_activate,
+};
+\end{lstlisting}
+
+上述代码展示了 \texttt{address\_space\_operations} 中三个核心回调的迁移过程。\texttt{readpage} 到 \texttt{read\_folio} 的迁移涉及多个变化：函数签名从 \texttt{struct page *page} 改为 \texttt{struct folio *folio}；位置计算从 \texttt{page\_offset(page)} 改为 \texttt{folio\_pos(folio)}；大小从隐含的 \texttt{PAGE\_SIZE} 改为通过 \texttt{folio\_size(folio)} 动态获取；状态标记从 \texttt{SetPageUptodate/SetPageError} 改为 \texttt{folio\_mark\_uptodate/folio\_set\_error}；解锁从 \texttt{unlock\_page} 改为 \texttt{folio\_unlock}。
+
+\texttt{set\_page\_dirty} 到 \texttt{dirty\_folio} 的迁移不仅涉及参数和返回值类型变化（\texttt{int} 改为 \texttt{bool}，增加 \texttt{mapping} 参数），底层实现也从 \texttt{\_\_set\_page\_dirty\_nobuffers} 替换为 \texttt{filemap\_dirty\_folio}。最后展示的完整 \texttt{address\_space\_operations} 结构体包含了迁移后的所有回调：核心读取使用 \texttt{read\_folio} 和 \texttt{readahead}；写入使用 \texttt{writepages}、\texttt{write\_begin}、\texttt{write\_end}（这两个仍使用 page 接口）；folio 状态管理使用 \texttt{dirty\_folio}、\texttt{release\_folio}、\texttt{invalidate\_folio}、\texttt{migrate\_folio}。这个结构体可以作为新文件系统实现的参考模板。
+
+\subsubsection{模式4：迭代器和批量操作迁移}
+
+\begin{lstlisting}[language=C,caption={迭代器迁移示例},label={lst:iterator-migration}]
+/*
+ * 迁移前：使用 pagevec 批量处理
+ */
+static void old_process_pages(struct address_space *mapping)
+{
+    struct pagevec pvec;
+    pgoff_t index = 0;
+    
+    pagevec_init(&pvec);
+    
+    while (pagevec_lookup(&pvec, mapping, &index)) {
+        int i;
+        
+        for (i = 0; i < pagevec_count(&pvec); i++) {
+            struct page *page = pvec.pages[i];
+            /* 处理页 */
+            process_single_page(page);
+        }
+        
+        pagevec_release(&pvec);
+    }
+}
+
+/*
+ * 迁移后：使用 folio_batch 批量处理
+ */
+static void new_process_folios(struct address_space *mapping)
+{
+    struct folio_batch fbatch;
+    pgoff_t index = 0;
+    
+    folio_batch_init(&fbatch);
+    
+    while (filemap_get_folios(mapping, &index, ULONG_MAX, &fbatch)) {
+        unsigned int i;
+        
+        for (i = 0; i < folio_batch_count(&fbatch); i++) {
+            struct folio *folio = fbatch.folios[i];
+            /* 处理 folio */
+            process_single_folio(folio);
+        }
+        
+        folio_batch_release(&fbatch);
+    }
+}
+
+/*
+ * 迁移前：使用 xarray 遍历 page
+ */
+static void old_xarray_walk(struct address_space *mapping)
+{
+    XA_STATE(xas, &mapping->i_pages, 0);
+    struct page *page;
+    
+    rcu_read_lock();
+    xas_for_each(&xas, page, ULONG_MAX) {
+        if (xa_is_value(page))
+            continue;
+        /* 处理 page */
+    }
+    rcu_read_unlock();
+}
+
+/*
+ * 迁移后：使用 xarray 遍历 folio
+ */
+static void new_xarray_walk(struct address_space *mapping)
+{
+    XA_STATE(xas, &mapping->i_pages, 0);
+    struct folio *folio;
+    
+    rcu_read_lock();
+    xas_for_each(&xas, folio, ULONG_MAX) {
+        if (xa_is_value(folio))
+            continue;
+        /* 处理 folio */
+        /* 注意：需要跳过 folio 覆盖的所有索引 */
+        xas_set(&xas, folio->index + folio_nr_pages(folio));
+    }
+    rcu_read_unlock();
+}
+\end{lstlisting}
+
+上述代码展示了两种批量遍历模式的迁移：\texttt{pagevec} 到 \texttt{folio\_batch}，以及 xarray 遍历从 page 到 folio 的转换。在 \texttt{pagevec} 迁移中，\texttt{pagevec\_init}、\texttt{pagevec\_lookup}、\texttt{pagevec\_count}、\texttt{pagevec\_release} 分别替换为 \texttt{folio\_batch\_init}、\texttt{filemap\_get\_folios}、\texttt{folio\_batch\_count}、\texttt{folio\_batch\_release}。\texttt{filemap\_get\_folios} 的第三个参数 \texttt{ULONG\_MAX} 表示搜索到地址空间末尾，函数通过 \texttt{\&index} 返回下一次搜索的起始位置。
+
+在 xarray 遍历迁移中，关键区别在于 folio 版本需要在每次迭代后通过 \texttt{xas\_set(\&xas, folio->index + folio\_nr\_pages(folio))} 手动跳过 folio 覆盖的所有索引。这是因为一个大 folio 在 xarray 中占据多个槽位，如果不跳过，\texttt{xas\_for\_each} 会对同一个 folio 的不同槽位多次返回同一个指针。两种遍历方式都在 RCU 读侧临界区（\texttt{rcu\_read\_lock/rcu\_read\_unlock}）中执行，并使用 \texttt{xa\_is\_value} 跳过影子条目（shadow entry，用于工作集检测的特殊标记值）。相比之下，使用 \texttt{folio\_batch} 的方式更加简洁安全，因为它在内部处理了所有复杂的索引跳过逻辑。
+
+\subsection{自动化迁移工具}
+
+\subsubsection{Coccinelle 语义补丁}
+
+Coccinelle 是一个强大的源代码转换工具，可以用于自动化 folio 迁移：
+
+\begin{lstlisting}[language=diff,caption={Coccinelle folio 迁移脚本},label={lst:coccinelle}]
+// folio_migration.cocci - 基础 API 迁移
+//
+// 用法: spatch --sp-file folio_migration.cocci --in-place FILE.c
+
+// 规则1：lock_page -> folio_lock
+@@
+expression page;
+@@
+
+- lock_page(page);
++ struct folio *folio = page_folio(page);
++ folio_lock(folio);
+
+// 规则2：unlock_page -> folio_unlock
+@@
+expression page;
+identifier folio;
+@@
+
+  struct folio *folio = page_folio(page);
+  ...
+- unlock_page(page);
++ folio_unlock(folio);
+
+// 规则3：PageDirty -> folio_test_dirty
+@@
+expression page;
+identifier folio;
+@@
+
+  struct folio *folio = page_folio(page);
+  ...
+- PageDirty(page)
++ folio_test_dirty(folio)
+
+// 规则4：SetPageUptodate -> folio_mark_uptodate
+@@
+expression page;
+identifier folio;
+@@
+
+  struct folio *folio = page_folio(page);
+  ...
+- SetPageUptodate(page);
++ folio_mark_uptodate(folio);
+
+// 规则5：get_page -> folio_get
+@@
+expression page;
+identifier folio;
+@@
+
+  struct folio *folio = page_folio(page);
+  ...
+- get_page(page);
++ folio_get(folio);
+
+// 规则6：put_page -> folio_put
+@@
+expression page;
+identifier folio;
+@@
+
+  struct folio *folio = page_folio(page);
+  ...
+- put_page(page);
++ folio_put(folio);
+
+// 规则7：page_mapping -> folio_mapping
+@@
+expression page;
+identifier folio;
+@@
+
+  struct folio *folio = page_folio(page);
+  ...
+- page_mapping(page)
++ folio_mapping(folio)
+
+// 规则8：page_index -> folio_index
+@@
+expression page;
+identifier folio;
+@@
+
+  struct folio *folio = page_folio(page);
+  ...
+- page_index(page)
++ folio_index(folio)
+\end{lstlisting}
+
+上述代码是一个基础的 Coccinelle 语义补丁文件，包含 8 条迁移规则。Coccinelle 使用语义补丁（semantic patch）语法，其中 \texttt{-} 开头的行表示要删除的代码模式，\texttt{+} 开头的行表示要插入的代码，\texttt{@@} 之间定义了元变量（metavariable），\texttt{...} 表示匹配任意中间代码。规则 1 和规则 2 协同工作：规则 1 在调用 \texttt{lock\_page} 的位置插入 \texttt{page\_folio} 转换和 \texttt{folio\_lock} 调用；规则 2 在已经有 folio 变量的上下文中将 \texttt{unlock\_page} 替换为 \texttt{folio\_unlock}。
+
+规则 3 到规则 8 分别处理标志位测试（\texttt{PageDirty} 到 \texttt{folio\_test\_dirty}）、标志位设置（\texttt{SetPageUptodate} 到 \texttt{folio\_mark\_uptodate}）、引用计数增加（\texttt{get\_page} 到 \texttt{folio\_get}）、引用计数减少（\texttt{put\_page} 到 \texttt{folio\_put}）、mapping 查询（\texttt{page\_mapping} 到 \texttt{folio\_mapping}）和索引查询（\texttt{page\_index} 到 \texttt{folio\_index}）。每条规则都要求上下文中已存在通过 \texttt{page\_folio} 创建的 folio 变量，确保转换的正确性。使用 \texttt{spatch --sp-file folio\_migration.cocci --in-place FILE.c} 命令即可应用这些规则。
+
+\subsubsection{更复杂的 Coccinelle 规则}
+
+\begin{lstlisting}[language=diff,caption={高级 Coccinelle 迁移规则},label={lst:coccinelle-advanced}]
+// folio_aops.cocci - address_space_operations 迁移
+//
+// 迁移 readpage 到 read_folio
+
+// 规则1：转换 readpage 函数签名
+@@
+identifier fn;
+identifier file, page;
+@@
+
+- int fn(struct file *file, struct page *page)
++ int fn(struct file *file, struct folio *folio)
+{
++ struct page *page = &folio->page;  // 临时兼容
+  ...
+}
+
+// 规则2：转换 aops 中的 readpage
+@@
+identifier fn;
+@@
+
+const struct address_space_operations ... = {
+  ...
+- .readpage = fn,
++ .read_folio = fn,
+  ...
+};
+
+// 规则3：转换 set_page_dirty 到 dirty_folio
+@@
+identifier fn;
+@@
+
+- int fn(struct page *page)
++ bool fn(struct address_space *mapping, struct folio *folio)
+{
+  ...
+}
+
+// 规则4：处理 PAGE_SIZE 到 folio_size
+@@
+identifier folio;
+@@
+
+  struct folio *folio;
+  ...
+- PAGE_SIZE
++ folio_size(folio)
+
+// 规则5：处理 page_offset 到 folio_pos
+@@
+identifier page, folio;
+@@
+
+  struct folio *folio = page_folio(page);
+  ...
+- page_offset(page)
++ folio_pos(folio)
+\end{lstlisting}
+
+上述高级 Coccinelle 规则处理了更复杂的迁移场景。规则 1 自动将 \texttt{readpage} 函数的签名从 \texttt{struct page *page} 转换为 \texttt{struct folio *folio}，并在函数体开头插入 \texttt{struct page *page = \&folio->page} 作为临时兼容层，使函数内部的 page 引用仍然有效。这是一种渐进式迁移策略，允许先完成接口迁移，再逐步替换内部实现。规则 2 将 \texttt{address\_space\_operations} 结构体中的 \texttt{.readpage} 字段替换为 \texttt{.read\_folio}。
+
+规则 3 处理 \texttt{set\_page\_dirty} 到 \texttt{dirty\_folio} 的迁移，不仅改变了参数类型（从 \texttt{struct page *} 到 \texttt{struct folio *}），还改变了返回值类型（从 \texttt{int} 到 \texttt{bool}）和增加了 \texttt{struct address\_space *mapping} 参数。规则 4 将函数体中的 \texttt{PAGE\_SIZE} 常量替换为 \texttt{folio\_size(folio)} 调用，但前提是当前作用域中存在名为 \texttt{folio} 的变量。规则 5 将 \texttt{page\_offset(page)} 替换为 \texttt{folio\_pos(folio)}。这些规则展示了 Coccinelle 语义补丁的强大能力：它理解 C 语言的语法结构和作用域规则，而不仅仅是文本替换。
+
+\subsubsection{使用脚本批量迁移}
+
+\begin{lstlisting}[language=bash,caption={批量迁移脚本},label={lst:batch-script}]
+#!/bin/bash
+# migrate_to_folio.sh - 批量 folio 迁移脚本
+
+KERNEL_DIR=${1:-"/path/to/kernel"}
+TARGET_DIR=${2:-"drivers/my_driver"}
+COCCI_SCRIPT=${3:-"folio_migration.cocci"}
+
+echo "开始 folio 迁移..."
+echo "内核目录: $KERNEL_DIR"
+echo "目标目录: $TARGET_DIR"
+
+# 查找所有 C 文件
+find "$KERNEL_DIR/$TARGET_DIR" -name "*.c" | while read file; do
+    echo "处理文件: $file"
+    
+    # 应用 Coccinelle 规则
+    spatch --sp-file "$COCCI_SCRIPT" \
+           --in-place \
+           --very-quiet \
+           "$file"
+    
+    # 检查是否有修改
+    if git diff --quiet "$file"; then
+        echo "  无变化"
+    else
+        echo "  已迁移"
+    fi
+done
+
+echo ""
+echo "迁移完成！请手动检查以下内容："
+echo "1. 编译是否通过"
+echo "2. 是否需要更新头文件包含"
+echo "3. 是否有遗漏的迁移点"
+
+# 编译测试
+echo ""
+echo "尝试编译..."
+make -C "$KERNEL_DIR" M="$TARGET_DIR" 2>&1 | head -50
+\end{lstlisting}
+
+上述 Shell 脚本实现了 Coccinelle 迁移的批量自动化流程。脚本接受三个参数：内核源码目录、目标子目录和 Coccinelle 语义补丁文件路径。它使用 \texttt{find} 命令遍历目标目录下的所有 \texttt{.c} 文件，对每个文件执行 \texttt{spatch} 命令应用语义补丁。\texttt{--in-place} 参数表示直接修改源文件，\texttt{--very-quiet} 参数抑制大部分输出信息。每个文件处理后，通过 \texttt{git diff --quiet} 检查文件是否被修改，给出相应的反馈。
+
+脚本最后提供了三项需要手动检查的事项：编译是否通过、头文件包含是否需要更新（例如添加 \texttt{\#include <linux/pagemap.h>}）、是否有 Coccinelle 规则无法覆盖的遗漏迁移点。最后自动尝试编译并显示前 50 行输出。需要注意的是，Coccinelle 的自动化迁移可能不完美，特别是在涉及宏展开、条件编译和复杂的指针别名场景时，因此脚本的提醒非常重要——自动化迁移只是第一步，仍需要人工审查和补充。
+
+\subsection{手动迁移步骤}
+
+对于复杂的代码，自动化工具可能无法完全处理。以下是推荐的手动迁移步骤：
+
+\subsubsection{步骤1：识别迁移范围}
+
+\begin{lstlisting}[language=bash,caption={识别需要迁移的代码},label={lst:identify-scope}]
+# 查找使用旧 API 的代码
+cd /path/to/kernel
+
+# 查找 readpage 回调
+grep -rn "\.readpage\s*=" drivers/my_driver/
+
+# 查找 set_page_dirty 回调
+grep -rn "\.set_page_dirty\s*=" drivers/my_driver/
+
+# 查找直接使用的 page API
+grep -rn "lock_page\|unlock_page\|PageDirty\|SetPageUptodate" \
+    drivers/my_driver/
+
+# 统计需要迁移的函数数量
+grep -rn "struct page \*" drivers/my_driver/ | wc -l
+\end{lstlisting}
+
+上述命令展示了在开始迁移前如何系统地识别需要修改的代码范围。第一条 \texttt{grep} 命令搜索 \texttt{.readpage} 回调的赋值语句，这是最高优先级的迁移目标，因为 \texttt{readpage} 在新版本内核中已被废弃。第二条命令搜索 \texttt{.set\_page\_dirty} 回调，它已被 \texttt{dirty\_folio} 替代。第三条命令搜索直接使用的 page API 函数调用（\texttt{lock\_page}、\texttt{unlock\_page}、\texttt{PageDirty}、\texttt{SetPageUptodate}），这些是需要逐个替换为 folio 对应版本的调用点。最后一条命令统计 \texttt{struct page *} 的出现次数，给出迁移工作量的大致估计。通过这些命令的输出，可以构建一份完整的迁移清单，按优先级和难度排序后制定迁移计划。
+
+\subsubsection{步骤2：创建迁移计划}
+
+\begin{table}[htbp]
+\centering
+\caption{迁移计划模板}
+\label{tab:migration-plan}
+\begin{tabularx}{\textwidth}{|l|l|l|X|}
+\hline
+\textbf{文件} & \textbf{函数} & \textbf{优先级} & \textbf{迁移难度} \\
+\hline
+my\_file.c & my\_readpage() & 高 & 中等（需要转换为 read\_folio） \\
+\hline
+my\_file.c & my\_set\_dirty() & 高 & 简单（直接替换） \\
+\hline
+my\_cache.c & cache\_lookup() & 中 & 复杂（涉及批量操作） \\
+\hline
+my\_io.c & do\_io() & 低 & 简单（仅涉及少量 page 调用） \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsubsection{步骤3：逐函数迁移}
+
+\begin{lstlisting}[language=C,caption={逐函数迁移示例},label={lst:step-by-step}]
+/*
+ * 原始函数
+ */
+static int my_readpage(struct file *file, struct page *page)
+{
+    struct inode *inode = page->mapping->host;
+    struct my_sb_info *sbi = MY_SB(inode->i_sb);
+    loff_t pos = page_offset(page);
+    void *addr;
+    int ret;
+    
+    addr = kmap_local_page(page);
+    ret = my_read_data(sbi, pos, addr, PAGE_SIZE);
+    kunmap_local(addr);
+    
+    if (ret == 0) {
+        SetPageUptodate(page);
+    } else {
+        SetPageError(page);
+        ret = -EIO;
+    }
+    
+    unlock_page(page);
+    return ret;
+}
+
+/*
+ * 步骤3.1：更改函数签名
+ */
+static int my_read_folio(struct file *file, struct folio *folio)
+{
+    /* 暂时保持内部实现不变 */
+    struct page *page = &folio->page;
+    struct inode *inode = page->mapping->host;
+    /* ... 其余代码相同 ... */
+}
+
+/*
+ * 步骤3.2：迁移内部实现
+ */
+static int my_read_folio(struct file *file, struct folio *folio)
+{
+    struct inode *inode = folio->mapping->host;  /* 直接使用 folio */
+    struct my_sb_info *sbi = MY_SB(inode->i_sb);
+    loff_t pos = folio_pos(folio);  /* 使用 folio API */
+    size_t len = folio_size(folio);  /* 支持大 folio */
+    void *addr;
+    int ret;
+    
+    addr = kmap_local_folio(folio, 0);  /* 使用 folio API */
+    ret = my_read_data(sbi, pos, addr, len);
+    kunmap_local(addr);
+    
+    if (ret == 0) {
+        folio_mark_uptodate(folio);  /* 使用 folio API */
+    } else {
+        folio_set_error(folio);  /* 使用 folio API */
+        ret = -EIO;
+    }
+    
+    folio_unlock(folio);  /* 使用 folio API */
+    return ret;
+}
+
+/*
+ * 步骤3.3：更新 address_space_operations
+ */
+const struct address_space_operations my_aops = {
+    .read_folio = my_read_folio,  /* 更新回调 */
+    /* ... */
+};
+\end{lstlisting}
+
+上述代码展示了逐函数迁移的三个子步骤。步骤 3.1 是最保守的起始方式：仅将函数签名从 \texttt{struct page *page} 改为 \texttt{struct folio *folio}，并在函数内部通过 \texttt{struct page *page = \&folio->page} 获取原始的 page 指针，使内部逻辑完全不变。这种方法的好处是可以立即将函数注册为 \texttt{.read\_folio} 回调，通过编译验证接口兼容性。
+
+步骤 3.2 是完整迁移：将所有内部实现都替换为 folio API。\texttt{folio->mapping->host} 替代 \texttt{page->mapping->host}；\texttt{folio\_pos(folio)} 替代 \texttt{page\_offset(page)}，它返回 folio 在文件中的字节偏移量；\texttt{folio\_size(folio)} 替代硬编码的 \texttt{PAGE\_SIZE}，使代码能正确处理大 folio；\texttt{kmap\_local\_folio(folio, 0)} 替代 \texttt{kmap\_local\_page(page)}，第二个参数 0 表示从 folio 起始位置开始映射；状态设置和锁操作也全部替换为对应的 folio 版本。步骤 3.3 则更新 \texttt{address\_space\_operations} 结构体中的回调指针，将 \texttt{.readpage} 替换为 \texttt{.read\_folio}。这种分步迁移的方法可以在每一步后独立编译和测试，降低引入错误的风险。
+
+\subsubsection{步骤4：编译和测试}
+
+\begin{lstlisting}[language=bash,caption={编译和测试步骤},label={lst:compile-test}]
+# 编译检查
+make -C /path/to/kernel M=drivers/my_driver/ W=1 2>&1 | tee build.log
+
+# 检查警告
+grep -E "(warning|error):" build.log
+
+# 如果有稀疏检查
+make -C /path/to/kernel M=drivers/my_driver/ C=1 2>&1 | tee sparse.log
+
+# 运行内核自测试（如果适用）
+cd /path/to/kernel
+./tools/testing/selftests/run_kselftest.sh -t filesystems
+
+# 使用 kunit 运行单元测试
+./tools/testing/kunit/kunit.py run --kunitconfig=drivers/my_driver/.kunitconfig
+\end{lstlisting}
+
+上述命令展示了迁移完成后的编译和测试流程。首先使用 \texttt{make} 命令编译修改过的模块，\texttt{W=1} 参数启用额外的编译器警告，\texttt{M=} 参数指定只编译特定子目录以加快编译速度，\texttt{tee} 将输出同时写入终端和日志文件。然后用 \texttt{grep} 过滤日志中的警告和错误信息。\texttt{C=1} 参数启用 \texttt{sparse} 静态分析工具，它可以检测类型不匹配、地址空间混淆（如 \texttt{\_\_user} 和 \texttt{\_\_kernel} 指针混用）等问题。
+
+\texttt{run\_kselftest.sh} 运行内核自测试套件中的文件系统相关测试，\texttt{-t filesystems} 参数限定只运行文件系统分类的测试用例。\texttt{kunit.py} 则运行 KUnit 单元测试，\texttt{--kunitconfig} 参数指定测试配置文件的路径。建议在迁移后按照"编译检查-静态分析-单元测试-自测试"的顺序逐步验证，确保每一步都通过后再进入下一步。
+
+\section{folio API 速查表}
+
+\subsection{基础操作}
+
+\begin{table}[htbp]
+\centering
+\caption{folio 基础操作 API}
+\label{tab:basic-api}
+\begin{tabularx}{\textwidth}{|l|l|X|}
+\hline
+\textbf{旧 API (page)} & \textbf{新 API (folio)} & \textbf{说明} \\
+\hline
+\multicolumn{3}{|c|}{\textbf{转换}} \\
+\hline
+\texttt{compound\_head(page)} & \texttt{page\_folio(page)} & 从 page 获取 folio \\
+\hline
+- & \texttt{folio\_page(folio, n)} & 获取 folio 中第 n 个 page \\
+\hline
+\multicolumn{3}{|c|}{\textbf{引用计数}} \\
+\hline
+\texttt{get\_page(page)} & \texttt{folio\_get(folio)} & 增加引用计数 \\
+\hline
+\texttt{put\_page(page)} & \texttt{folio\_put(folio)} & 减少引用计数 \\
+\hline
+\texttt{page\_ref\_count(page)} & \texttt{folio\_ref\_count(folio)} & 获取引用计数 \\
+\hline
+\texttt{try\_get\_page(page)} & \texttt{folio\_try\_get(folio)} & 尝试增加引用计数 \\
+\hline
+\multicolumn{3}{|c|}{\textbf{锁操作}} \\
+\hline
+\texttt{lock\_page(page)} & \texttt{folio\_lock(folio)} & 获取锁 \\
+\hline
+\texttt{trylock\_page(page)} & \texttt{folio\_trylock(folio)} & 尝试获取锁 \\
+\hline
+\texttt{unlock\_page(page)} & \texttt{folio\_unlock(folio)} & 释放锁 \\
+\hline
+\texttt{wait\_on\_page\_locked(page)} & \texttt{folio\_wait\_locked(folio)} & 等待解锁 \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsection{属性查询}
+
+\begin{table}[htbp]
+\centering
+\caption{folio 属性查询 API}
+\label{tab:property-api}
+\begin{tabularx}{\textwidth}{|l|l|X|}
+\hline
+\textbf{旧 API} & \textbf{新 API} & \textbf{说明} \\
+\hline
+\multicolumn{3}{|c|}{\textbf{大小和位置}} \\
+\hline
+\texttt{PAGE\_SIZE} & \texttt{folio\_size(folio)} & 获取字节大小 \\
+\hline
+\texttt{compound\_order(page)} & \texttt{folio\_order(folio)} & 获取 order \\
+\hline
+\texttt{compound\_nr(page)} & \texttt{folio\_nr\_pages(folio)} & 获取页数 \\
+\hline
+\texttt{page\_offset(page)} & \texttt{folio\_pos(folio)} & 获取文件偏移 \\
+\hline
+\texttt{page\_index(page)} & \texttt{folio\_index(folio)} & 获取页索引 \\
+\hline
+\texttt{page\_file\_offset(page)} & \texttt{folio\_file\_pos(folio)} & 获取文件位置 \\
+\hline
+\multicolumn{3}{|c|}{\textbf{映射信息}} \\
+\hline
+\texttt{page\_mapping(page)} & \texttt{folio\_mapping(folio)} & 获取 mapping \\
+\hline
+\texttt{page\_mapped(page)} & \texttt{folio\_mapped(folio)} & 是否被映射 \\
+\hline
+\texttt{page\_mapcount(page)} & \texttt{folio\_mapcount(folio)} & 映射计数 \\
+\hline
+\texttt{page\_address(page)} & \texttt{folio\_address(folio)} & 虚拟地址 \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsection{标志位操作}
+
+\begin{table}[htbp]
+\centering
+\caption{folio 标志位操作 API}
+\label{tab:flags-api}
+\begin{tabularx}{\textwidth}{|X|X|X|}
+\hline
+\textbf{测试} & \textbf{设置} & \textbf{清除} \\
+\hline
+\multicolumn{3}{|c|}{\textbf{基础标志}} \\
+\hline
+\texttt{folio\_test\_locked()} & \texttt{folio\_set\_locked()} & \texttt{folio\_clear\_locked()} \\
+\hline
+\texttt{folio\_test\_uptodate()} & \texttt{folio\_mark\_uptodate()} & - \\
+\hline
+\texttt{folio\_test\_dirty()} & \texttt{folio\_mark\_dirty()} & \texttt{folio\_clear\_dirty()} \\
+\hline
+\texttt{folio\_test\_writeback()} & \texttt{folio\_start\_writeback()} & \texttt{folio\_end\_writeback()} \\
+\hline
+\texttt{folio\_test\_error()} & \texttt{folio\_set\_error()} & \texttt{folio\_clear\_error()} \\
+\hline
+\multicolumn{3}{|c|}{\textbf{LRU 相关}} \\
+\hline
+\texttt{folio\_test\_lru()} & \texttt{folio\_set\_lru()} & \texttt{folio\_clear\_lru()} \\
+\hline
+\texttt{folio\_test\_active()} & \texttt{folio\_set\_active()} & \texttt{folio\_clear\_active()} \\
+\hline
+\texttt{folio\_test\_referenced()} & \texttt{folio\_set\_referenced()} & \texttt{folio\_clear\_referenced()} \\
+\hline
+\texttt{folio\_test\_workingset()} & \texttt{folio\_set\_workingset()} & \texttt{folio\_clear\_workingset()} \\
+\hline
+\multicolumn{3}{|c|}{\textbf{类型标志}} \\
+\hline
+\texttt{folio\_test\_anon()} & - & - \\
+\hline
+\texttt{folio\_test\_swapcache()} & - & - \\
+\hline
+\texttt{folio\_test\_swapbacked()} & - & - \\
+\hline
+\texttt{folio\_test\_large()} & - & - \\
+\hline
+\texttt{folio\_test\_hugetlb()} & - & - \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsection{页缓存操作}
+
+\begin{table}[htbp]
+\centering
+\caption{folio 页缓存操作 API}
+\label{tab:pagecache-api}
+\begin{tabularx}{\textwidth}{|l|X|}
+\hline
+\textbf{API} & \textbf{说明} \\
+\hline
+\multicolumn{2}{|c|}{\textbf{查找}} \\
+\hline
+\texttt{filemap\_get\_folio(mapping, index)} & 在页缓存中查找 folio \\
+\hline
+\texttt{\_\_filemap\_get\_folio(mapping, index, flags, gfp)} & 带标志的查找/创建 \\
+\hline
+\texttt{filemap\_get\_folios(mapping, \&start, end, fbatch)} & 批量获取 folio \\
+\hline
+\texttt{filemap\_get\_folios\_contig(mapping, \&start, end, fbatch)} & 获取连续 folio \\
+\hline
+\multicolumn{2}{|c|}{\textbf{添加/删除}} \\
+\hline
+\texttt{filemap\_add\_folio(mapping, folio, index, gfp)} & 添加到页缓存 \\
+\hline
+\texttt{filemap\_remove\_folio(folio)} & 从页缓存删除 \\
+\hline
+\texttt{folio\_add\_to\_page\_cache\_lru(folio, mapping, index, gfp)} & 添加并加入 LRU \\
+\hline
+\multicolumn{2}{|c|}{\textbf{分配}} \\
+\hline
+\texttt{filemap\_alloc\_folio(gfp, order)} & 分配用于页缓存的 folio \\
+\hline
+\texttt{folio\_alloc(gfp, order)} & 分配通用 folio \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsection{内存映射操作}
+
+\begin{table}[htbp]
+\centering
+\caption{folio 内存映射操作 API}
+\label{tab:mapping-api}
+\begin{tabularx}{\textwidth}{|l|X|}
+\hline
+\textbf{API} & \textbf{说明} \\
+\hline
+\multicolumn{2}{|c|}{\textbf{kmap 操作}} \\
+\hline
+\texttt{kmap\_local\_folio(folio, offset)} & 临时映射 folio \\
+\hline
+\texttt{kunmap\_local(addr)} & 取消临时映射 \\
+\hline
+\texttt{folio\_address(folio)} & 获取 folio 的虚拟地址（如果直接映射） \\
+\hline
+\multicolumn{2}{|c|}{\textbf{零填充}} \\
+\hline
+\texttt{folio\_zero\_segment(folio, start, end)} & 填充区间为零 \\
+\hline
+\texttt{folio\_zero\_range(folio, start, len)} & 填充指定长度为零 \\
+\hline
+\texttt{folio\_zero\_tail(folio, offset, kaddr)} & 从 offset 到末尾填零 \\
+\hline
+\multicolumn{2}{|c|}{\textbf{拷贝操作}} \\
+\hline
+\texttt{folio\_copy(dst, src)} & 拷贝整个 folio \\
+\hline
+\texttt{memcpy\_from\_folio(dst, folio, offset, len)} & 从 folio 拷贝数据 \\
+\hline
+\texttt{memcpy\_to\_folio(folio, offset, src, len)} & 拷贝数据到 folio \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsection{回写操作}
+
+\begin{table}[htbp]
+\centering
+\caption{folio 回写操作 API}
+\label{tab:writeback-api}
+\begin{tabularx}{\textwidth}{|l|X|}
+\hline
+\textbf{API} & \textbf{说明} \\
+\hline
+\texttt{folio\_start\_writeback(folio)} & 开始回写 \\
+\hline
+\texttt{folio\_end\_writeback(folio)} & 结束回写 \\
+\hline
+\texttt{folio\_wait\_writeback(folio)} & 等待回写完成 \\
+\hline
+\texttt{folio\_wait\_stable(folio)} & 等待 folio 稳定 \\
+\hline
+\texttt{folio\_redirty\_for\_writepage(folio, wbc)} & 重新标记为脏 \\
+\hline
+\texttt{folio\_write\_one(folio)} & 写入单个 folio \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsection{LRU 操作}
+
+\begin{table}[htbp]
+\centering
+\caption{folio LRU 操作 API}
+\label{tab:lru-api}
+\begin{tabularx}{\textwidth}{|l|X|}
+\hline
+\textbf{API} & \textbf{说明} \\
+\hline
+\texttt{folio\_add\_lru(folio)} & 添加到 LRU \\
+\hline
+\texttt{folio\_add\_lru\_vma(folio, vma)} & 添加到 LRU（带 VMA） \\
+\hline
+\texttt{folio\_activate(folio)} & 激活 folio \\
+\hline
+\texttt{folio\_deactivate(folio)} & 去激活 folio \\
+\hline
+\texttt{folio\_mark\_accessed(folio)} & 标记为已访问 \\
+\hline
+\texttt{folio\_mark\_lazyfree(folio)} & 标记为延迟释放 \\
+\hline
+\texttt{folio\_batch\_add\_and\_move(fbatch, folio, lru)} & 批量移动到 LRU \\
+\hline
+\end{tabularx}
+\end{table}
+
+\section{常见错误和陷阱}
+
+\subsection{错误1：混淆 page 和 folio 引用计数}
+
+\begin{lstlisting}[language=C,caption={混淆引用计数的错误},label={lst:refcount-mistake}]
+/*
+ * 错误示例：混用 page 和 folio 的引用计数
+ */
+void buggy_function(struct page *page)
+{
+    struct folio *folio = page_folio(page);
+    
+    /* 错误：增加了 page 的引用计数 */
+    get_page(page);
+    
+    /* ... 一些操作 ... */
+    
+    /* 错误：减少了 folio 的引用计数
+     * 如果 page 是尾页，这会导致引用计数不匹配！
+     */
+    folio_put(folio);
+}
+
+/*
+ * 正确做法：统一使用 folio 引用计数
+ */
+void correct_function(struct page *page)
+{
+    struct folio *folio = page_folio(page);
+    
+    /* 正确：使用 folio 的引用计数 */
+    folio_get(folio);
+    
+    /* ... 一些操作 ... */
+    
+    /* 正确：对应的 put */
+    folio_put(folio);
+}
+\end{lstlisting}
+
+\begin{warningbox}
+引用计数不匹配是一个严重的 bug，可能导致：
+\begin{itemize}
+    \item 内存泄漏（引用计数永远不为 0）
+    \item 使用已释放内存（引用计数过早归零）
+    \item 难以调试的内核崩溃
+\end{itemize}
+\end{warningbox}
+
+\subsection{错误2：假设 folio 大小等于 PAGE\_SIZE}
+
+\begin{lstlisting}[language=C,caption={假设大小的错误},label={lst:size-mistake}]
+/*
+ * 错误示例：硬编码 PAGE_SIZE
+ */
+void buggy_read(struct folio *folio, void *buffer)
+{
+    void *addr = kmap_local_folio(folio, 0);
+    
+    /* 错误：假设大小是 PAGE_SIZE */
+    memcpy(buffer, addr, PAGE_SIZE);
+    
+    kunmap_local(addr);
+}
+
+/*
+ * 正确做法：使用 folio 的实际大小
+ */
+void correct_read(struct folio *folio, void *buffer)
+{
+    void *addr = kmap_local_folio(folio, 0);
+    
+    /* 正确：使用实际大小 */
+    memcpy(buffer, addr, folio_size(folio));
+    
+    kunmap_local(addr);
+}
+
+/*
+ * 对于大 folio，可能需要分段处理
+ */
+void correct_read_large(struct folio *folio, void *buffer)
+{
+    size_t offset = 0;
+    size_t remaining = folio_size(folio);
+    
+    while (remaining > 0) {
+        void *addr;
+        size_t len = min(remaining, (size_t)PAGE_SIZE);
+        
+        addr = kmap_local_folio(folio, offset);
+        memcpy((char *)buffer + offset, addr, len);
+        kunmap_local(addr);
+        
+        offset += len;
+        remaining -= len;
+    }
+}
+\end{lstlisting}
+
+上述代码通过三个函数揭示了假设 folio 大小等于 \texttt{PAGE\_SIZE} 的错误。\texttt{buggy\_read} 函数使用 \texttt{kmap\_local\_folio} 映射 folio 后，用硬编码的 \texttt{PAGE\_SIZE} 作为拷贝长度。当 folio 是大 folio（例如 order-2，大小为 \texttt{4 * PAGE\_SIZE}）时，只会拷贝第一个页面的数据，丢失其余部分；当代码用于写入场景时，还可能导致数据损坏。
+
+\texttt{correct\_read} 通过 \texttt{folio\_size(folio)} 获取 folio 的真实大小来修复这个问题。但需要注意，\texttt{kmap\_local\_folio} 在高端内存（HIGHMEM）架构上一次只能映射一个页面大小的窗口，因此 \texttt{correct\_read\_large} 展示了处理大 folio 的完整方法：使用 \texttt{while} 循环按 \texttt{PAGE\_SIZE} 分段映射和拷贝，\texttt{kmap\_local\_folio} 的第二个参数 \texttt{offset} 指定从 folio 中的哪个偏移开始映射，每次映射一个页面大小的窗口，逐段完成数据拷贝。在 64 位系统上所有物理内存都可以直接映射，\texttt{kmap\_local\_folio} 的实现通常是轻量级的，但为了可移植性，分段处理仍然是最安全的做法。
+
+\subsection{错误3：忽略 folio 在多个索引位置}
+
+\begin{lstlisting}[language=C,caption={忽略多索引的错误},label={lst:index-mistake}]
+/*
+ * 错误示例：遍历时没有跳过 folio 覆盖的索引
+ */
+void buggy_iterate(struct address_space *mapping)
+{
+    pgoff_t index;
+    
+    for (index = 0; index < max_index; index++) {
+        struct folio *folio = filemap_get_folio(mapping, index);
+        if (!folio)
+            continue;
+            
+        /* 错误：可能会多次处理同一个 folio！
+         * 如果 folio 是 order-2（4 页），index 0,1,2,3 
+         * 都会返回同一个 folio
+         */
+        process_folio(folio);
+        folio_put(folio);
+    }
+}
+
+/*
+ * 正确做法：跳过 folio 覆盖的所有索引
+ */
+void correct_iterate(struct address_space *mapping)
+{
+    pgoff_t index = 0;
+    
+    while (index < max_index) {
+        struct folio *folio = filemap_get_folio(mapping, index);
+        if (!folio) {
+            index++;
+            continue;
+        }
+        
+        process_folio(folio);
+        
+        /* 正确：跳过 folio 覆盖的所有索引 */
+        index = folio_next_index(folio);
+        folio_put(folio);
+    }
+}
+
+/*
+ * 或者使用批量 API
+ */
+void best_iterate(struct address_space *mapping)
+{
+    struct folio_batch fbatch;
+    pgoff_t index = 0;
+    
+    folio_batch_init(&fbatch);
+    
+    while (filemap_get_folios(mapping, &index, ULONG_MAX, &fbatch)) {
+        unsigned int i;
+        
+        /* filemap_get_folios 已经正确处理了跳过 */
+        for (i = 0; i < folio_batch_count(&fbatch); i++) {
+            process_folio(fbatch.folios[i]);
+        }
+        
+        folio_batch_release(&fbatch);
+    }
+}
+\end{lstlisting}
+
+上述代码揭示了遍历页缓存时忽略大 folio 多索引覆盖的严重错误。\texttt{buggy\_iterate} 函数使用简单的 \texttt{for} 循环逐索引查找 folio，但一个 order-2 的 folio 覆盖了 4 个连续索引（例如索引 0、1、2、3），\texttt{filemap\_get\_folio} 对这 4 个索引都会返回同一个 folio。这意味着 \texttt{process\_folio} 会被重复调用 4 次，可能导致重复计数、重复 I/O 或其他逻辑错误。
+
+\texttt{correct\_iterate} 通过 \texttt{folio\_next\_index(folio)} 获取当前 folio 覆盖范围之后的第一个索引，直接跳过所有被覆盖的索引，确保每个 folio 只被处理一次。\texttt{best\_iterate} 展示了更优雅的解决方案：使用 \texttt{filemap\_get\_folios} 批量获取 folio，该 API 内部已经正确处理了索引跳过逻辑，返回的 \texttt{folio\_batch} 中每个 folio 都是唯一的。这种批量 API 不仅代码更简洁，而且性能更好（减少了锁获取次数），是推荐的遍历方式。
+
+\subsection{错误4：在持有锁时进行阻塞操作}
+
+\begin{lstlisting}[language=C,caption={锁和阻塞的错误},label={lst:lock-mistake}]
+/*
+ * 错误示例：持有 folio 锁时睡眠
+ */
+void buggy_locked_io(struct folio *folio)
+{
+    folio_lock(folio);
+    
+    /* 错误：持有锁时可能睡眠的操作 */
+    void *buf = kmalloc(folio_size(folio), GFP_KERNEL);
+    if (!buf) {
+        folio_unlock(folio);
+        return;
+    }
+    
+    /* 继续处理... */
+    folio_unlock(folio);
+    kfree(buf);
+}
+
+/*
+ * 正确做法：在加锁前完成可能睡眠的操作
+ */
+void correct_locked_io(struct folio *folio)
+{
+    /* 正确：先分配内存 */
+    void *buf = kmalloc(folio_size(folio), GFP_KERNEL);
+    if (!buf)
+        return;
+    
+    folio_lock(folio);
+    /* 持有锁时的操作应该尽量简短 */
+    folio_unlock(folio);
+    
+    kfree(buf);
+}
+
+/*
+ * 如果必须在锁中分配内存
+ */
+void correct_locked_io_v2(struct folio *folio)
+{
+    void *buf;
+    
+    folio_lock(folio);
+    
+    /* 使用 GFP_ATOMIC 或 GFP_NOWAIT */
+    buf = kmalloc(folio_size(folio), GFP_ATOMIC);
+    if (!buf) {
+        folio_unlock(folio);
+        return;
+    }
+    
+    /* 处理... */
+    folio_unlock(folio);
+    kfree(buf);
+}
+\end{lstlisting}
+
+上述代码展示了在持有 folio 锁时进行阻塞操作的错误及其修正方法。\texttt{buggy\_locked\_io} 函数在 \texttt{folio\_lock} 之后调用 \texttt{kmalloc(GFP\_KERNEL)}，而 \texttt{GFP\_KERNEL} 标志允许内存分配器在内存不足时进入直接回收路径，直接回收可能需要获取其他 folio 的锁，如果这些 folio 恰好由同一个线程持有，就会导致死锁（ABBA 死锁模式）。
+
+\texttt{correct\_locked\_io} 展示了最推荐的修正方法：将可能睡眠的内存分配移到加锁之前。这样既避免了死锁风险，又使锁内的操作路径更短、更可预测。\texttt{correct\_locked\_io\_v2} 则展示了当确实需要在锁内分配内存时的替代方案：使用 \texttt{GFP\_ATOMIC}（或 \texttt{GFP\_NOWAIT}）标志，这些标志禁止分配器睡眠，如果当前没有可用内存则立即返回 NULL。这种方法的代价是分配成功率较低，因此需要妥善处理分配失败的情况。作为一般原则，持有 folio 锁时应当避免任何可能睡眠的操作，包括但不限于内存分配、I/O 操作和获取其他互斥锁。
+
+\subsection{错误5：不正确的 folio 生命周期管理}
+
+\begin{lstlisting}[language=C,caption={生命周期管理错误},label={lst:lifecycle-mistake}]
+/*
+ * 错误示例：返回 folio 但忘记获取引用
+ */
+struct folio *buggy_get_cached_folio(struct address_space *mapping,
+                                      pgoff_t index)
+{
+    struct folio *folio = filemap_get_folio(mapping, index);
+    
+    if (folio) {
+        /* 做一些处理... */
+        
+        /* 错误：释放了引用后返回 folio
+         * 调用者使用的是悬空指针！
+         */
+        folio_put(folio);
+    }
+    
+    return folio;  /* 危险！ */
+}
+
+/*
+ * 正确做法1：转移引用给调用者
+ */
+struct folio *correct_get_cached_folio_v1(struct address_space *mapping,
+                                           pgoff_t index)
+{
+    struct folio *folio = filemap_get_folio(mapping, index);
+    
+    if (folio) {
+        /* 做一些处理... */
+        /* 正确：保持引用计数，调用者负责 put */
+    }
+    
+    return folio;  /* 调用者需要调用 folio_put() */
+}
+
+/*
+ * 正确做法2：清晰的文档说明
+ */
+/**
+ * correct_get_cached_folio_v2 - 获取页缓存中的 folio
+ * @mapping: 地址空间
+ * @index: 页索引
+ *
+ * 返回: 找到的 folio（已增加引用计数），或 NULL
+ *
+ * 调用者负责在使用完毕后调用 folio_put() 释放引用。
+ */
+struct folio *correct_get_cached_folio_v2(struct address_space *mapping,
+                                           pgoff_t index)
+{
+    return filemap_get_folio(mapping, index);
+}
+
+/*
+ * 正确做法3：如果需要处理后不返回引用
+ */
+int correct_process_cached_folio(struct address_space *mapping,
+                                  pgoff_t index)
+{
+    struct folio *folio = filemap_get_folio(mapping, index);
+    int ret = -ENOENT;
+    
+    if (folio) {
+        ret = do_something_with_folio(folio);
+        folio_put(folio);  /* 这里释放是正确的 */
+    }
+    
+    return ret;  /* 不返回 folio */
+}
+\end{lstlisting}
+
+上述代码展示了 folio 生命周期管理中最常见的错误：返回悬空指针。\texttt{buggy\_get\_cached\_folio} 函数通过 \texttt{filemap\_get\_folio} 获取了一个带引用计数的 folio，但在处理后调用了 \texttt{folio\_put} 释放引用，然后却返回了这个 folio 指针。此时调用者拿到的是一个可能已经被释放或回收的指针，任何后续操作都是未定义行为，可能导致内核崩溃或数据损坏。
+
+正确做法有三种。第一种（\texttt{correct\_get\_cached\_folio\_v1}）是将引用所有权转移给调用者——不调用 \texttt{folio\_put}，由调用者在使用完毕后负责释放。第二种（\texttt{correct\_get\_cached\_folio\_v2}）通过内核文档注释（\texttt{/** ... */} 格式）明确说明返回的 folio 已增加引用计数，调用者需要调用 \texttt{folio\_put} 释放。第三种（\texttt{correct\_process\_cached\_folio}）改变函数设计，不返回 folio 本身，而是在函数内部完成所有操作后释放引用，返回操作结果的错误码。这种模式最安全，因为 folio 的生命周期完全在单个函数内管理，不存在引用归属的歧义。
+
+\subsection{常见错误检查清单}
+
+\begin{table}[htbp]
+\centering
+\caption{folio 使用错误检查清单}
+\label{tab:error-checklist}
+\begin{tabularx}{\textwidth}{|l|X|c|}
+\hline
+\textbf{检查项} & \textbf{说明} & \textbf{检查} \\
+\hline
+\multicolumn{3}{|c|}{\textbf{引用计数}} \\
+\hline
+get/put 配对 & 每个 folio\_get() 必须有对应的 folio\_put() & $\square$ \\
+\hline
+统一接口 & 不要混用 get\_page/folio\_put & $\square$ \\
+\hline
+返回值处理 & 返回 folio 时明确引用归属 & $\square$ \\
+\hline
+\multicolumn{3}{|c|}{\textbf{锁}} \\
+\hline
+lock/unlock 配对 & 每个 folio\_lock() 必须有对应的 folio\_unlock() & $\square$ \\
+\hline
+避免死锁 & 不要在持有 folio 锁时获取其他可能冲突的锁 & $\square$ \\
+\hline
+睡眠检查 & 持有锁时避免可能睡眠的操作 & $\square$ \\
+\hline
+\multicolumn{3}{|c|}{\textbf{大小处理}} \\
+\hline
+使用 folio\_size() & 不要硬编码 PAGE\_SIZE & $\square$ \\
+\hline
+检查 order & 需要时使用 folio\_order() 而非假设 0 & $\square$ \\
+\hline
+索引跳过 & 遍历时正确跳过 folio 覆盖的索引 & $\square$ \\
+\hline
+\multicolumn{3}{|c|}{\textbf{类型安全}} \\
+\hline
+正确转换 & 使用 page\_folio() 而非强制转换 & $\square$ \\
+\hline
+检查空值 & 处理 API 返回的 NULL & $\square$ \\
+\hline
+验证状态 & 检查 folio 标志位的假设是否正确 & $\square$ \\
+\hline
+\end{tabularx}
+\end{table}
+
+\section{调试 folio 相关问题}
+
+\subsection{使用 VM\_BUG\_ON\_FOLIO}
+
+\begin{lstlisting}[language=C,caption={使用断言调试},label={lst:debug-assert}]
+/*
+ * VM_BUG_ON_FOLIO - folio 专用断言宏
+ *
+ * 当条件为真时触发 BUG，并打印 folio 信息
+ */
+
+void my_function(struct folio *folio)
+{
+    /* 检查 folio 是否被锁定 */
+    VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+    
+    /* 检查引用计数是否有效 */
+    VM_BUG_ON_FOLIO(folio_ref_count(folio) <= 0, folio);
+    
+    /* 检查是否在正确的 mapping 中 */
+    VM_BUG_ON_FOLIO(folio->mapping != expected_mapping, folio);
+    
+    /* ... */
+}
+
+/*
+ * 自定义调试输出
+ */
+void debug_dump_folio(struct folio *folio)
+{
+    pr_info("Folio dump:\n");
+    pr_info("  flags: 0x%lx\n", folio->flags);
+    pr_info("  mapping: %px\n", folio->mapping);
+    pr_info("  index: %lu\n", folio->index);
+    pr_info("  refcount: %d\n", folio_ref_count(folio));
+    pr_info("  mapcount: %d\n", folio_mapcount(folio));
+    pr_info("  order: %u\n", folio_order(folio));
+    pr_info("  nr_pages: %lu\n", folio_nr_pages(folio));
+    pr_info("  size: %zu\n", folio_size(folio));
+    
+    /* 打印标志位 */
+    pr_info("  locked: %d\n", folio_test_locked(folio));
+    pr_info("  uptodate: %d\n", folio_test_uptodate(folio));
+    pr_info("  dirty: %d\n", folio_test_dirty(folio));
+    pr_info("  writeback: %d\n", folio_test_writeback(folio));
+    pr_info("  lru: %d\n", folio_test_lru(folio));
+    pr_info("  active: %d\n", folio_test_active(folio));
+}
+\end{lstlisting}
+
+上述代码展示了使用 \texttt{VM\_BUG\_ON\_FOLIO} 宏和自定义调试输出函数来调试 folio 相关问题。\texttt{VM\_BUG\_ON\_FOLIO} 是 folio 专用的断言宏，当条件为真时触发内核 BUG 并自动打印出 folio 的详细信息（包括 flags、mapping、index 等），帮助开发者快速定位问题。代码中展示了三种典型的断言检查：确认 folio 已被锁定（\texttt{!folio\_test\_locked}）、引用计数有效（\texttt{folio\_ref\_count <= 0}）、以及 folio 属于预期的 mapping。这些断言仅在内核编译时启用了 \texttt{CONFIG\_DEBUG\_VM} 时才生效，生产环境中不会产生任何开销。
+
+\texttt{debug\_dump\_folio} 函数提供了更详细的调试信息输出。它使用 \texttt{pr\_info} 打印 folio 的所有关键字段：\texttt{flags} 包含所有标志位的原始值，\texttt{mapping} 显示所属的地址空间指针（使用 \texttt{\%px} 格式避免地址哈希），\texttt{index} 是在页缓存中的索引位置，\texttt{refcount} 和 \texttt{mapcount} 分别是引用计数和页表映射计数，\texttt{order}、\texttt{nr\_pages} 和 \texttt{size} 反映 folio 的大小信息。最后还单独打印各个标志位的布尔状态，方便直观判断 folio 当前的生命周期阶段。
+
+\subsection{使用 ftrace 跟踪}
+
+\begin{lstlisting}[language=bash,caption={使用 ftrace 跟踪 folio 操作},label={lst:ftrace}]
+# 启用 folio 相关的跟踪点
+cd /sys/kernel/debug/tracing
+
+# 查看可用的跟踪点
+cat available_events | grep folio
+
+# 启用特定跟踪点
+echo 1 > events/filemap/mm_filemap_add_to_page_cache/enable
+echo 1 > events/filemap/mm_filemap_delete_from_page_cache/enable
+echo 1 > events/writeback/folio_wait_writeback/enable
+
+# 设置过滤器（可选）
+echo 'mapping != 0' > events/filemap/mm_filemap_add_to_page_cache/filter
+
+# 开始跟踪
+echo 1 > tracing_on
+
+# 运行测试
+# ...
+
+# 停止跟踪
+echo 0 > tracing_on
+
+# 查看结果
+cat trace
+
+# 或者保存到文件
+cat trace > /tmp/folio_trace.txt
+\end{lstlisting}
+
+上述命令展示了使用 \texttt{ftrace}（内核内置的跟踪框架）来监控 folio 操作的方法。首先通过 \texttt{available\_events} 文件查看系统中所有与 folio 相关的跟踪点。然后通过向 \texttt{enable} 文件写入 1 来激活特定的跟踪点：\texttt{mm\_filemap\_add\_to\_page\_cache} 跟踪 folio 被添加到页缓存的事件，\texttt{mm\_filemap\_delete\_from\_page\_cache} 跟踪 folio 从页缓存中删除的事件，\texttt{folio\_wait\_writeback} 跟踪等待回写完成的事件。
+
+可以通过 \texttt{filter} 文件设置过滤条件（如 \texttt{mapping != 0}），只记录满足条件的事件，减少跟踪数据量。通过 \texttt{tracing\_on} 文件控制跟踪的启停，\texttt{trace} 文件包含跟踪结果，格式包括时间戳、CPU 号、进程名、PID 和跟踪点参数。这种方法的优势在于它是内核内置的，不需要额外安装工具，且开销很小，适合在生产环境中进行短期问题排查。
+
+\subsection{添加自定义跟踪点}
+
+\begin{lstlisting}[language=C,caption={添加自定义跟踪点},label={lst:custom-trace}]
+/*
+ * include/trace/events/my_folio.h
+ */
+#undef TRACE_SYSTEM
+#define TRACE_SYSTEM my_folio
+
+#if !defined(_TRACE_MY_FOLIO_H) || defined(TRACE_HEADER_MULTI_READ)
+#define _TRACE_MY_FOLIO_H
+
+#include <linux/tracepoint.h>
+
+TRACE_EVENT(my_folio_access,
+    TP_PROTO(struct folio *folio, const char *func),
+    
+    TP_ARGS(folio, func),
+    
+    TP_STRUCT__entry(
+        __field(unsigned long, pfn)
+        __field(unsigned long, index)
+        __field(unsigned int, order)
+        __field(int, refcount)
+        __string(func, func)
+    ),
+    
+    TP_fast_assign(
+        __entry->pfn = folio_pfn(folio);
+        __entry->index = folio->index;
+        __entry->order = folio_order(folio);
+        __entry->refcount = folio_ref_count(folio);
+        __assign_str(func, func);
+    ),
+    
+    TP_printk("folio pfn=%lu index=%lu order=%u ref=%d func=%s",
+          __entry->pfn, __entry->index, __entry->order,
+          __entry->refcount, __get_str(func))
+);
+
+TRACE_EVENT(my_folio_error,
+    TP_PROTO(struct folio *folio, int error, const char *msg),
+    
+    TP_ARGS(folio, error, msg),
+    
+    TP_STRUCT__entry(
+        __field(unsigned long, pfn)
+        __field(int, error)
+        __string(msg, msg)
+    ),
+    
+    TP_fast_assign(
+        __entry->pfn = folio_pfn(folio);
+        __entry->error = error;
+        __assign_str(msg, msg);
+    ),
+    
+    TP_printk("folio pfn=%lu error=%d msg=%s",
+          __entry->pfn, __entry->error, __get_str(msg))
+);
+
+#endif /* _TRACE_MY_FOLIO_H */
+
+#include <trace/define_trace.h>
+
+/*
+ * 在代码中使用跟踪点
+ */
+#include <trace/events/my_folio.h>
+
+void my_function(struct folio *folio)
+{
+    trace_my_folio_access(folio, __func__);
+    
+    /* ... 操作 ... */
+    
+    if (error) {
+        trace_my_folio_error(folio, error, "operation failed");
+    }
+}
+\end{lstlisting}
+
+上述代码展示了如何为 folio 操作创建自定义跟踪点。头文件 \texttt{my\_folio.h} 使用 \texttt{TRACE\_EVENT} 宏定义了两个跟踪点：\texttt{my\_folio\_access} 记录 folio 的访问操作，它捕获 folio 的物理页帧号（pfn）、索引、order、引用计数和调用函数名；\texttt{my\_folio\_error} 记录错误事件，它捕获 pfn、错误码和错误消息。每个跟踪点通过 \texttt{TP\_PROTO} 定义参数原型、\texttt{TP\_STRUCT\_\_entry} 定义存储的字段、\texttt{TP\_fast\_assign} 定义赋值逻辑、\texttt{TP\_printk} 定义输出格式。
+
+头文件使用标准的 \texttt{TRACE\_HEADER\_MULTI\_READ} 保护宏和 \texttt{trace/define\_trace.h} 包含，遵循内核跟踪点的标准定义模式。在实际代码中，通过 \texttt{trace\_my\_folio\_access(folio, \_\_func\_\_)} 和 \texttt{trace\_my\_folio\_error(folio, error, "operation failed")} 调用这些跟踪点。当跟踪点未启用时，这些调用的开销接近于零（仅一次静态分支预测）；启用后，数据会被写入环形缓冲区，可以通过 \texttt{/sys/kernel/debug/tracing/trace} 或 \texttt{perf} 工具读取。
+
+\subsection{使用 crash 工具分析}
+
+\begin{lstlisting}[language=bash,caption={使用 crash 分析 folio},label={lst:crash}]
+# 启动 crash
+crash /usr/lib/debug/lib/modules/$(uname -r)/vmlinux /var/crash/vmcore
+
+# 查看 folio 结构定义
+crash> struct folio
+
+# 查看特定 folio 的内容
+crash> struct folio 0xffffea0001234000
+
+# 查看 folio 的标志位
+crash> p ((struct folio *)0xffffea0001234000)->flags
+
+# 解析标志位
+crash> eval -b ((struct folio *)0xffffea0001234000)->flags
+
+# 查看 mapping
+crash> struct address_space 0xffff888012345678
+
+# 查看页缓存中的 folio
+crash> tree -t xarray 0xffff888012345678.i_pages
+
+# 查找引用某个 folio 的进程
+crash> search -t 0xffffea0001234000
+
+# 查看 LRU 列表
+crash> list -H folio.lru 0xffffea0001234000
+\end{lstlisting}
+
+上述命令展示了使用 \texttt{crash} 工具分析内核转储中 folio 状态的方法。\texttt{crash} 是 Linux 内核崩溃分析的标准工具，它加载 vmlinux 调试符号文件和内核转储文件（vmcore）后，可以检查内核数据结构的内容。\texttt{struct folio} 命令可以查看 folio 结构体的定义，而带地址参数时则显示该地址处 folio 实例的具体字段值。\texttt{eval -b} 命令以二进制格式解析 flags 字段，方便识别各个标志位的状态。
+
+\texttt{tree -t xarray} 命令可以遍历 \texttt{address\_space} 的 \texttt{i\_pages} xarray，显示页缓存中的所有 folio。\texttt{search -t} 命令在整个内核内存中搜索指定的 folio 地址，帮助找出哪些数据结构引用了该 folio。\texttt{list -H folio.lru} 命令通过 \texttt{lru} 链表头遍历 LRU 列表，显示与指定 folio 在同一个 LRU 链中的所有条目。这些命令的组合使用可以帮助开发者在内核崩溃后完整重建 folio 的状态和关联关系，定位引用计数泄漏、死锁或数据损坏等问题的根因。
+
+\section{性能考虑和优化}
+
+\subsection{减少锁竞争}
+
+\begin{lstlisting}[language=C,caption={减少锁竞争的技巧},label={lst:reduce-contention}]
+/*
+ * 技巧1：批量操作
+ */
+void efficient_batch_process(struct address_space *mapping,
+                              pgoff_t start, pgoff_t end)
+{
+    struct folio_batch fbatch;
+    
+    folio_batch_init(&fbatch);
+    
+    /* 批量获取减少锁获取次数 */
+    while (filemap_get_folios(mapping, &start, end, &fbatch)) {
+        unsigned int i;
+        
+        for (i = 0; i < folio_batch_count(&fbatch); i++) {
+            struct folio *folio = fbatch.folios[i];
+            
+            if (folio_trylock(folio)) {
+                /* 成功获取锁 */
+                process_folio(folio);
+                folio_unlock(folio);
+            }
+            /* 获取失败时跳过，避免等待 */
+        }
+        
+        folio_batch_release(&fbatch);
+    }
+}
+
+/*
+ * 技巧2：使用 trylock 避免阻塞
+ */
+int try_process_folio(struct folio *folio)
+{
+    if (!folio_trylock(folio))
+        return -EAGAIN;  /* 返回后重试 */
+    
+    /* 快速处理 */
+    process_folio(folio);
+    
+    folio_unlock(folio);
+    return 0;
+}
+
+/*
+ * 技巧3：减少锁持有时间
+ */
+void minimize_lock_time(struct folio *folio, void *data)
+{
+    void *buffer;
+    
+    /* 在锁外分配内存 */
+    buffer = kmalloc(folio_size(folio), GFP_KERNEL);
+    if (!buffer)
+        return;
+    
+    folio_lock(folio);
+    
+    /* 快速拷贝数据 */
+    memcpy_from_folio(buffer, folio, 0, folio_size(folio));
+    
+    folio_unlock(folio);  /* 尽早释放锁 */
+    
+    /* 在锁外处理数据 */
+    process_data(buffer, folio_size(folio));
+    
+    kfree(buffer);
+}
+\end{lstlisting}
+
+上述代码展示了三种减少 folio 锁竞争的实用技巧。第一种是批量操作：\texttt{efficient\_batch\_process} 使用 \texttt{folio\_batch} 批量获取 folio，减少了对 xarray 锁的获取次数（一次 \texttt{filemap\_get\_folios} 调用可获取多个 folio），同时在加锁时使用 \texttt{folio\_trylock} 而非阻塞的 \texttt{folio\_lock}，获取失败时直接跳过该 folio，避免在热点路径上等待。
+
+第二种技巧是 \texttt{try\_process\_folio} 中展示的非阻塞模式：当 \texttt{folio\_trylock} 返回 false 时，函数返回 \texttt{-EAGAIN} 让调用者稍后重试，而不是在锁上忙等。这种模式特别适合可以延迟处理的场景，如后台扫描和非关键路径的操作。
+
+第三种技巧是 \texttt{minimize\_lock\_time} 中展示的最小化锁持有时间：将可能阻塞的内存分配（\texttt{kmalloc} 使用 \texttt{GFP\_KERNEL}）移到加锁之前，锁内只执行快速的数据拷贝操作（\texttt{memcpy\_from\_folio}），然后尽早释放锁，在锁外进行耗时的数据处理。这种``拷贝-释放锁-处理''的模式在内核中非常常见，可以显著提升高并发场景下的吞吐量。
+
+\subsection{利用大 folio}
+
+\begin{lstlisting}[language=C,caption={利用大 folio 提升性能},label={lst:large-folio}]
+/*
+ * 使用大 folio 可以减少元数据开销和 TLB 压力
+ */
+
+/**
+ * 分配大 folio（当有利于性能时）
+ */
+struct folio *allocate_optimal_folio(struct address_space *mapping,
+                                      pgoff_t index, size_t size)
+{
+    unsigned int order;
+    struct folio *folio;
+    
+    /* 计算最优的 order */
+    if (size >= PMD_SIZE && mapping_large_folio_support(mapping)) {
+        order = PMD_ORDER;  /* 尝试分配 PMD 大小的 folio */
+    } else if (size >= (64 * PAGE_SIZE)) {
+        order = 6;  /* 64 页 */
+    } else if (size >= (16 * PAGE_SIZE)) {
+        order = 4;  /* 16 页 */
+    } else {
+        order = 0;  /* 默认单页 */
+    }
+    
+    /* 尝试分配，如果失败则降级 */
+    while (order > 0) {
+        folio = filemap_alloc_folio(GFP_KERNEL | __GFP_COMP, order);
+        if (folio)
+            return folio;
+        order--;
+    }
+    
+    /* 最后尝试分配单页 */
+    return filemap_alloc_folio(GFP_KERNEL, 0);
+}
+
+/**
+ * 检查是否应该使用大 folio
+ */
+bool should_use_large_folio(struct inode *inode, pgoff_t index)
+{
+    struct address_space *mapping = inode->i_mapping;
+    loff_t size = i_size_read(inode);
+    
+    /* 小文件不需要大 folio */
+    if (size < 16 * PAGE_SIZE)
+        return false;
+    
+    /* 检查 mapping 是否支持大 folio */
+    if (!mapping_large_folio_support(mapping))
+        return false;
+    
+    /* 顺序读取模式适合大 folio */
+    if (inode->i_readahead_policy == READAHEAD_SEQUENTIAL)
+        return true;
+    
+    return false;
+}
+
+/**
+ * 预读时使用大 folio
+ */
+void readahead_with_large_folios(struct readahead_control *ractl)
+{
+    struct address_space *mapping = ractl->mapping;
+    unsigned int order = 0;
+    
+    if (mapping_large_folio_support(mapping)) {
+        /* 根据预读大小选择 folio order */
+        unsigned long ra_pages = readahead_count(ractl);
+        
+        if (ra_pages >= 256)
+            order = 6;  /* 64 页 */
+        else if (ra_pages >= 64)
+            order = 4;  /* 16 页 */
+        else if (ra_pages >= 16)
+            order = 2;  /* 4 页 */
+    }
+    
+    /* 使用选定的 order 进行预读 */
+    while (readahead_count(ractl)) {
+        struct folio *folio = readahead_folio(ractl, order);
+        if (!folio) {
+            if (order == 0)
+                break;
+            order--;
+            continue;
+        }
+        
+        /* 启动 I/O */
+        submit_folio_read(folio);
+    }
+}
+\end{lstlisting}
+
+上述代码展示了利用大 folio 提升性能的三种策略。\texttt{allocate\_optimal\_folio} 函数根据请求大小选择最优的 folio order：对于 PMD 大小（通常为 2MB）以上的请求且 mapping 支持大 folio 时使用 \texttt{PMD\_ORDER}；对于 64 页以上使用 order-6；16 页以上使用 order-4；否则使用默认单页。分配时采用逐级降级策略——如果高 order 分配失败，则递减 order 重试，最终保证至少能分配到一个单页 folio。
+
+\texttt{should\_use\_large\_folio} 函数提供了一个决策逻辑：小文件（小于 16 页）不值得使用大 folio（因为内部碎片浪费过多）；mapping 必须通过 \texttt{mapping\_large\_folio\_support} 检查明确支持大 folio；只有顺序读取模式才能充分利用大 folio 的优势（随机读取场景下大 folio 反而可能增加不必要的 I/O）。
+
+\texttt{readahead\_with\_large\_folios} 函数将大 folio 应用于预读路径。它根据预读窗口大小（\texttt{readahead\_count}）选择 folio order：预读 256 页以上用 order-6，64 页以上用 order-4，16 页以上用 order-2。然后在循环中通过 \texttt{readahead\_folio} 分配 folio 并提交读取。使用大 folio 进行预读可以显著减少元数据开销（一个 order-4 的 folio 只需要一个 \texttt{struct folio} 而非 16 个 \texttt{struct page}），减少 TLB 条目消耗，并提升连续 I/O 的吞吐量。
+
+\subsection{内存局部性优化}
+
+\begin{lstlisting}[language=C,caption={内存局部性优化},label={lst:locality}]
+/*
+ * 利用 folio 提升缓存局部性
+ */
+
+/**
+ * 处理连续的 folio 时，利用空间局部性
+ */
+void process_contiguous_range(struct address_space *mapping,
+                               pgoff_t start, pgoff_t end)
+{
+    struct folio_batch fbatch;
+    
+    folio_batch_init(&fbatch);
+    
+    /* filemap_get_folios_contig 返回连续的 folio */
+    while (start < end && 
+           filemap_get_folios_contig(mapping, &start, end - 1, &fbatch)) {
+        unsigned int i;
+        
+        /* 预取下一批 folio */
+        prefetch_folios_range(mapping, start, 
+                              min(start + FOLIO_BATCH_SIZE, end));
+        
+        for (i = 0; i < folio_batch_count(&fbatch); i++) {
+            struct folio *folio = fbatch.folios[i];
+            
+            /* 由于是连续的，可能在同一个缓存行 */
+            process_folio_fast(folio);
+        }
+        
+        folio_batch_release(&fbatch);
+    }
+}
+
+/**
+ * 避免随机访问模式
+ */
+void avoid_random_access(struct address_space *mapping, 
+                          pgoff_t *indices, int count)
+{
+    /* 先排序索引 */
+    sort(indices, count, sizeof(pgoff_t), cmpfunc, NULL);
+    
+    /* 然后顺序访问 */
+    for (int i = 0; i < count; i++) {
+        struct folio *folio = filemap_get_folio(mapping, indices[i]);
+        if (folio) {
+            process_folio(folio);
+            folio_put(folio);
+        }
+    }
+}
+\end{lstlisting}
+
+上述代码展示了两种利用 folio 优化内存局部性的技术。\texttt{process\_contiguous\_range} 函数使用 \texttt{filemap\_get\_folios\_contig}（而非普通的 \texttt{filemap\_get\_folios}）获取地址空间中连续的 folio。连续 folio 在物理内存中也往往是连续的，因此可以充分利用 CPU 缓存的空间局部性。在处理当前批次的同时，调用 \texttt{prefetch\_folios\_range} 预取下一批 folio 的数据到 CPU 缓存，形成流水线效果，减少缓存未命中导致的停顿。
+
+\texttt{avoid\_random\_access} 函数处理一组随机索引的访问请求。直接按随机顺序访问会导致大量缓存未命中和磁盘随机 I/O。该函数先用 \texttt{sort} 对索引数组排序，然后按顺序访问页缓存。这种优化将随机访问模式转化为顺序访问模式，不仅提升了 CPU 缓存命中率，还有利于触发预读机制，大幅提升 I/O 性能。在实际文件系统中，这种排序后顺序访问的模式被广泛应用于批量文件操作和数据库查询。
+
+\subsection{性能监控}
+
+\begin{lstlisting}[language=bash,caption={folio 性能监控脚本},label={lst:monitor}]
+#!/bin/bash
+# folio_perf_monitor.sh - folio 性能监控
+
+# 监控 folio 相关的计数器
+watch -n 1 "cat /proc/vmstat | grep -E 'pgfault|pgmajfault|pswpin|pswpout|pgalloc|pgfree'"
+
+# 使用 perf 监控 folio 操作
+perf stat -e 'mm:*folio*' -a sleep 10
+
+# 跟踪 folio 分配和释放
+perf probe --add 'folio_alloc'
+perf probe --add 'folio_put'
+perf record -e probe:folio_alloc -e probe:folio_put -a sleep 10
+perf script
+
+# 分析火焰图
+perf record -g -a sleep 30
+perf script | stackcollapse-perf.pl | flamegraph.pl > folio_flamegraph.svg
+
+# 监控大 folio 使用
+echo "=== Large Folio Statistics ==="
+cat /proc/vmstat | grep -E 'thp_|folio_'
+
+# 监控 LRU 状态
+echo "=== LRU Statistics ==="
+cat /proc/vmstat | grep -E 'nr_active|nr_inactive|nr_isolated'
+\end{lstlisting}
+
+上述脚本展示了多种 folio 性能监控方法。第一种使用 \texttt{watch} 命令每秒刷新 \texttt{/proc/vmstat} 中的关键计数器，包括缺页次数（\texttt{pgfault}）、主缺页次数（\texttt{pgmajfault}）、换入换出（\texttt{pswpin/pswpout}）和页分配释放（\texttt{pgalloc/pgfree}），这些指标可以反映 folio 在页缓存和内存管理中的表现。第二种使用 \texttt{perf stat} 统计 folio 相关跟踪点的触发次数，\texttt{-a} 参数表示监控所有 CPU。
+
+第三种方法通过 \texttt{perf probe} 动态添加 \texttt{folio\_alloc} 和 \texttt{folio\_put} 探针，然后用 \texttt{perf record} 采样并用 \texttt{perf script} 输出，可以详细了解 folio 的分配和释放模式。第四种方法使用 \texttt{perf record -g}（带调用栈）采样后生成火焰图（flamegraph），通过 \texttt{stackcollapse-perf.pl} 和 \texttt{flamegraph.pl} 工具可视化 folio 操作在整个系统调用栈中的位置和时间占比。最后两条命令分别监控大 folio（THP 相关）和 LRU 列表的统计信息。
+
+\section{测试 folio 代码}
+
+\subsection{单元测试框架}
+
+\begin{lstlisting}[language=C,caption={folio 单元测试},label={lst:unit-test}]
+/*
+ * lib/test_folio.c - folio 单元测试
+ */
+#include <kunit/test.h>
+#include <linux/pagemap.h>
+
+/* 测试 folio 分配 */
+static void test_folio_alloc(struct kunit *test)
+{
+    struct folio *folio;
+    
+    /* 测试单页 folio */
+    folio = folio_alloc(GFP_KERNEL, 0);
+    KUNIT_ASSERT_NOT_NULL(test, folio);
+    KUNIT_EXPECT_EQ(test, folio_order(folio), 0);
+    KUNIT_EXPECT_EQ(test, folio_nr_pages(folio), 1);
+    KUNIT_EXPECT_EQ(test, folio_size(folio), PAGE_SIZE);
+    KUNIT_EXPECT_EQ(test, folio_ref_count(folio), 1);
+    folio_put(folio);
+    
+    /* 测试大 folio */
+    folio = folio_alloc(GFP_KERNEL, 2);
+    KUNIT_ASSERT_NOT_NULL(test, folio);
+    KUNIT_EXPECT_EQ(test, folio_order(folio), 2);
+    KUNIT_EXPECT_EQ(test, folio_nr_pages(folio), 4);
+    KUNIT_EXPECT_EQ(test, folio_size(folio), 4 * PAGE_SIZE);
+    folio_put(folio);
+}
+
+/* 测试引用计数 */
+static void test_folio_refcount(struct kunit *test)
+{
+    struct folio *folio;
+    
+    folio = folio_alloc(GFP_KERNEL, 0);
+    KUNIT_ASSERT_NOT_NULL(test, folio);
+    
+    /* 初始引用计数为 1 */
+    KUNIT_EXPECT_EQ(test, folio_ref_count(folio), 1);
+    
+    /* 增加引用计数 */
+    folio_get(folio);
+    KUNIT_EXPECT_EQ(test, folio_ref_count(folio), 2);
+    
+    folio_get(folio);
+    KUNIT_EXPECT_EQ(test, folio_ref_count(folio), 3);
+    
+    /* 减少引用计数 */
+    folio_put(folio);
+    KUNIT_EXPECT_EQ(test, folio_ref_count(folio), 2);
+    
+    folio_put(folio);
+    KUNIT_EXPECT_EQ(test, folio_ref_count(folio), 1);
+    
+    /* 最后一个 put 应该释放 folio */
+    folio_put(folio);
+}
+
+/* 测试锁操作 */
+static void test_folio_lock(struct kunit *test)
+{
+    struct folio *folio;
+    
+    folio = folio_alloc(GFP_KERNEL, 0);
+    KUNIT_ASSERT_NOT_NULL(test, folio);
+    
+    /* 初始状态未锁定 */
+    KUNIT_EXPECT_FALSE(test, folio_test_locked(folio));
+    
+    /* 锁定 */
+    folio_lock(folio);
+    KUNIT_EXPECT_TRUE(test, folio_test_locked(folio));
+    
+    /* trylock 应该失败 */
+    KUNIT_EXPECT_FALSE(test, folio_trylock(folio));
+    
+    /* 解锁 */
+    folio_unlock(folio);
+    KUNIT_EXPECT_FALSE(test, folio_test_locked(folio));
+    
+    /* trylock 应该成功 */
+    KUNIT_EXPECT_TRUE(test, folio_trylock(folio));
+    folio_unlock(folio);
+    
+    folio_put(folio);
+}
+
+/* 测试标志位操作 */
+static void test_folio_flags(struct kunit *test)
+{
+    struct folio *folio;
+    
+    folio = folio_alloc(GFP_KERNEL, 0);
+    KUNIT_ASSERT_NOT_NULL(test, folio);
+    
+    /* 测试 dirty 标志 */
+    KUNIT_EXPECT_FALSE(test, folio_test_dirty(folio));
+    folio_mark_dirty(folio);
+    KUNIT_EXPECT_TRUE(test, folio_test_dirty(folio));
+    folio_clear_dirty_for_io(folio);
+    KUNIT_EXPECT_FALSE(test, folio_test_dirty(folio));
+    
+    /* 测试 uptodate 标志 */
+    KUNIT_EXPECT_FALSE(test, folio_test_uptodate(folio));
+    folio_mark_uptodate(folio);
+    KUNIT_EXPECT_TRUE(test, folio_test_uptodate(folio));
+    
+    folio_put(folio);
+}
+
+/* 测试 page_folio 转换 */
+static void test_page_folio(struct kunit *test)
+{
+    struct folio *folio;
+    struct page *page;
+    unsigned int i;
+    
+    /* 分配 order-2 folio (4 pages) */
+    folio = folio_alloc(GFP_KERNEL, 2);
+    KUNIT_ASSERT_NOT_NULL(test, folio);
+    
+    /* 验证所有页都转换回同一个 folio */
+    for (i = 0; i < folio_nr_pages(folio); i++) {
+        page = folio_page(folio, i);
+        KUNIT_EXPECT_PTR_EQ(test, page_folio(page), folio);
+    }
+    
+    folio_put(folio);
+}
+
+static struct kunit_case folio_test_cases[] = {
+    KUNIT_CASE(test_folio_alloc),
+    KUNIT_CASE(test_folio_refcount),
+    KUNIT_CASE(test_folio_lock),
+    KUNIT_CASE(test_folio_flags),
+    KUNIT_CASE(test_page_folio),
+    {}
+};
+
+static struct kunit_suite folio_test_suite = {
+    .name = "folio",
+    .test_cases = folio_test_cases,
+};
+
+kunit_test_suite(folio_test_suite);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Folio unit tests");
+\end{lstlisting}
+
+上述代码使用 KUnit 框架编写了一组 folio 单元测试。\texttt{test\_folio\_alloc} 测试分别验证了单页 folio（order-0）和大 folio（order-2，即 4 页）的分配，检查 \texttt{folio\_order}、\texttt{folio\_nr\_pages}、\texttt{folio\_size} 和 \texttt{folio\_ref\_count} 的返回值是否正确。\texttt{test\_folio\_refcount} 测试验证引用计数的增减操作：初始为 1，两次 \texttt{folio\_get} 后变为 3，两次 \texttt{folio\_put} 后回到 1，最后一次 \texttt{folio\_put} 释放 folio。
+
+\texttt{test\_folio\_lock} 测试验证锁的行为：初始状态未锁定，\texttt{folio\_lock} 后 \texttt{folio\_test\_locked} 返回 true，此时 \texttt{folio\_trylock} 应返回 false（因为已经持有锁），\texttt{folio\_unlock} 后再次 \texttt{folio\_trylock} 应返回 true。\texttt{test\_folio\_flags} 测试验证脏标志和 uptodate 标志的设置与清除操作。\texttt{test\_page\_folio} 测试是最关键的测试之一：它分配一个 order-2 的 folio，然后通过 \texttt{folio\_page} 获取每个子页，再用 \texttt{page\_folio} 转换回来，验证所有子页都能正确映射回同一个 folio。最后，所有测试用例通过 \texttt{kunit\_test\_suite} 注册到 KUnit 框架中。
+
+\subsection{集成测试}
+
+\begin{lstlisting}[language=bash,caption={folio 集成测试脚本},label={lst:integration-test}]
+#!/bin/bash
+# test_folio_integration.sh - folio 集成测试
+
+set -e
+
+TEST_DIR="/tmp/folio_test_$$"
+RESULT_FILE="/tmp/folio_test_result_$$"
+
+cleanup() {
+    rm -rf "$TEST_DIR"
+    rm -f "$RESULT_FILE"
+}
+trap cleanup EXIT
+
+mkdir -p "$TEST_DIR"
+cd "$TEST_DIR"
+
+echo "=== folio 集成测试 ==="
+
+# 测试1：页缓存基本操作
+echo "测试1：页缓存操作..."
+dd if=/dev/zero of=testfile bs=4K count=1024 2>/dev/null
+sync
+echo 3 > /proc/sys/vm/drop_caches  # 清空缓存
+cat testfile > /dev/null  # 重新读入
+grep -E "^Cached:" /proc/meminfo
+
+# 测试2：大文件读写
+echo "测试2：大文件读写..."
+dd if=/dev/zero of=largefile bs=1M count=100 2>/dev/null
+sync
+md5sum largefile > "$RESULT_FILE"
+echo 3 > /proc/sys/vm/drop_caches
+cat largefile | md5sum | diff - "$RESULT_FILE"
+echo "大文件完整性: 通过"
+
+# 测试3：并发访问
+echo "测试3：并发访问..."
+for i in $(seq 1 10); do
+    dd if=/dev/zero of=concurrent_$i bs=4K count=100 2>/dev/null &
+done
+wait
+for i in $(seq 1 10); do
+    cat concurrent_$i > /dev/null &
+done
+wait
+echo "并发访问: 通过"
+
+# 测试4：内存压力下的行为
+echo "测试4：内存压力测试..."
+# 创建大量文件填充页缓存
+for i in $(seq 1 100); do
+    dd if=/dev/zero of=pressure_$i bs=1M count=10 2>/dev/null
+done
+# 检查系统是否正常
+free -h
+cat /proc/vmstat | grep -E 'pgfault|pgmajfault'
+
+# 测试5：mmap 和 folio
+echo "测试5：mmap 测试..."
+cat > mmap_test.c << 'EOF'
+#include <stdio.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+
+int main() {
+    int fd = open("mmap_file", O_RDWR | O_CREAT, 0644);
+    ftruncate(fd, 4096);
+    
+    char *addr = mmap(NULL, 4096, PROT_READ | PROT_WRITE, 
+                      MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+    
+    strcpy(addr, "Hello, folio!");
+    msync(addr, 4096, MS_SYNC);
+    
+    munmap(addr, 4096);
+    close(fd);
+    
+    return 0;
+}
+EOF
+gcc -o mmap_test mmap_test.c
+./mmap_test
+cat mmap_file
+echo ""
+echo "mmap 测试: 通过"
+
+echo ""
+echo "=== 所有测试通过 ==="
+\end{lstlisting}
+
+上述脚本实现了一套完整的 folio 集成测试流程。测试 1 验证页缓存的基本操作：先用 \texttt{dd} 创建一个 4MB 的测试文件，通过 \texttt{sync} 强制同步后清空缓存，再重新读入以验证页缓存功能正常。测试 2 通过 \texttt{md5sum} 校验大文件（100MB）在写入、清空缓存、重新读取后的数据完整性。测试 3 启动 10 个并行的 \texttt{dd} 写入进程和 10 个并行读取进程，验证并发访问不会导致数据损坏或死锁。
+
+测试 4 通过创建大量文件（共约 1GB）模拟内存压力场景，观察系统在页缓存占用大量内存时的行为，通过 \texttt{free} 和 \texttt{/proc/vmstat} 检查缺页次数和主缺页次数。测试 5 编译并运行一个 C 程序来验证 \texttt{mmap} 功能，该程序通过 \texttt{MAP\_SHARED} 映射文件、写入数据、调用 \texttt{msync} 同步后检查数据是否正确持久化。所有测试使用 \texttt{trap cleanup EXIT} 确保即使测试失败也能清理临时文件。
+
+\subsection{压力测试}
+
+\begin{lstlisting}[language=C,caption={folio 压力测试内核模块},label={lst:stress-test}]
+/*
+ * test_folio_stress.c - folio 压力测试模块
+ */
+#include <linux/module.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/pagemap.h>
+#include <linux/random.h>
+
+static int num_threads = 4;
+module_param(num_threads, int, 0644);
+
+static int duration_sec = 60;
+module_param(duration_sec, int, 0644);
+
+static atomic_t running_threads = ATOMIC_INIT(0);
+static atomic64_t total_operations = ATOMIC64_INIT(0);
+static bool stop_test = false;
+
+/* 测试线程：随机分配和释放 folio */
+static int stress_thread(void *data)
+{
+    int thread_id = (int)(long)data;
+    struct folio *folios[16];
+    int count = 0;
+    unsigned long ops = 0;
+    
+    atomic_inc(&running_threads);
+    
+    pr_info("Stress thread %d started\n", thread_id);
+    
+    while (!kthread_should_stop() && !stop_test) {
+        unsigned int action = get_random_u32() % 3;
+        
+        switch (action) {
+        case 0:  /* 分配 */
+            if (count < 16) {
+                unsigned int order = get_random_u32() % 3;
+                folios[count] = folio_alloc(GFP_KERNEL | __GFP_NOWARN, order);
+                if (folios[count]) {
+                    /* 做一些操作 */
+                    folio_lock(folios[count]);
+                    folio_mark_dirty(folios[count]);
+                    folio_unlock(folios[count]);
+                    count++;
+                }
+            }
+            break;
+            
+        case 1:  /* 释放 */
+            if (count > 0) {
+                count--;
+                folio_put(folios[count]);
+            }
+            break;
+            
+        case 2:  /* 访问 */
+            if (count > 0) {
+                int idx = get_random_u32() % count;
+                struct folio *folio = folios[idx];
+                
+                folio_get(folio);
+                folio_lock(folio);
+                /* 模拟一些工作 */
+                if (folio_test_dirty(folio))
+                    folio_clear_dirty_for_io(folio);
+                folio_unlock(folio);
+                folio_put(folio);
+            }
+            break;
+        }
+        
+        ops++;
+        
+        /* 偶尔让出 CPU */
+        if ((ops % 1000) == 0)
+            cond_resched();
+    }
+    
+    /* 清理 */
+    while (count > 0) {
+        count--;
+        folio_put(folios[count]);
+    }
+    
+    atomic64_add(ops, &total_operations);
+    atomic_dec(&running_threads);
+    
+    pr_info("Stress thread %d completed: %lu operations\n", thread_id, ops);
+    
+    return 0;
+}
+
+static struct task_struct *threads[32];
+
+static int __init folio_stress_init(void)
+{
+    int i;
+    
+    pr_info("Starting folio stress test with %d threads for %d seconds\n",
+            num_threads, duration_sec);
+    
+    /* 启动测试线程 */
+    for (i = 0; i < num_threads && i < 32; i++) {
+        threads[i] = kthread_run(stress_thread, (void *)(long)i,
+                                  "folio_stress_%d", i);
+        if (IS_ERR(threads[i])) {
+            pr_err("Failed to create thread %d\n", i);
+            threads[i] = NULL;
+        }
+    }
+    
+    /* 等待测试完成 */
+    msleep(duration_sec * 1000);
+    stop_test = true;
+    
+    /* 等待线程结束 */
+    for (i = 0; i < num_threads && i < 32; i++) {
+        if (threads[i])
+            kthread_stop(threads[i]);
+    }
+    
+    pr_info("Folio stress test completed\n");
+    pr_info("Total operations: %lld\n", atomic64_read(&total_operations));
+    pr_info("Operations/sec: %lld\n", 
+            atomic64_read(&total_operations) / duration_sec);
+    
+    return 0;
+}
+
+static void __exit folio_stress_exit(void)
+{
+    pr_info("Folio stress test module unloaded\n");
+}
+
+module_init(folio_stress_init);
+module_exit(folio_stress_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Folio stress test");
+\end{lstlisting}
+
+上述代码实现了一个 folio 压力测试内核模块，用于验证 folio 相关操作在高并发场景下的正确性和稳定性。模块通过 \texttt{module\_param} 接受两个参数：\texttt{num\_threads} 控制并发线程数（默认 4），\texttt{duration\_sec} 控制测试持续时间（默认 60 秒）。原子变量 \texttt{running\_threads} 和 \texttt{total\_operations} 分别用于跟踪运行中的线程数和总操作次数。
+
+每个压力测试线程 \texttt{stress\_thread} 维护一个最多 16 个 folio 的数组，在循环中随机执行三种操作：分配（随机 order 0-2 的 folio，分配后加锁、标记脏、解锁）、释放（减少数组计数并调用 \texttt{folio\_put}）、访问（随机选择一个已有 folio，增加引用计数、加锁、检查并清除脏标志、解锁、释放引用）。每执行 1000 次操作后调用 \texttt{cond\_resched()} 让出 CPU，避免占用过多时间片。线程退出前会清理所有未释放的 folio，确保没有内存泄漏。
+
+模块初始化函数 \texttt{folio\_stress\_init} 创建所有测试线程后，通过 \texttt{msleep} 等待指定时间，然后设置 \texttt{stop\_test} 标志并逐一停止线程。最终输出总操作次数和每秒操作数作为性能指标。这种测试方法可以有效发现引用计数不匹配、死锁、竞态条件等并发问题。
+
+\section{实际迁移案例分析}
+
+\subsection{案例1：简单驱动程序迁移}
+
+\begin{lstlisting}[language=C,caption={简单驱动程序迁移案例},label={lst:case-driver}]
+/*
+ * 案例：一个简单的块设备驱动迁移
+ * 
+ * 迁移前的代码
+ */
+
+/* old_driver.c - 原始实现 */
+static int old_readpage(struct file *file, struct page *page)
+{
+    struct inode *inode = page->mapping->host;
+    struct my_device *dev = inode->i_sb->s_fs_info;
+    sector_t sector = page->index << (PAGE_SHIFT - 9);
+    int ret;
+    
+    lock_page(page);
+    
+    ret = my_device_read(dev, sector, page_address(page), PAGE_SIZE);
+    
+    if (ret == 0) {
+        SetPageUptodate(page);
+    } else {
+        ClearPageUptodate(page);
+        SetPageError(page);
+    }
+    
+    unlock_page(page);
+    return ret;
+}
+
+static int old_writepage(struct page *page, struct writeback_control *wbc)
+{
+    struct inode *inode = page->mapping->host;
+    struct my_device *dev = inode->i_sb->s_fs_info;
+    sector_t sector = page->index << (PAGE_SHIFT - 9);
+    int ret;
+    
+    set_page_writeback(page);
+    
+    ret = my_device_write(dev, sector, page_address(page), PAGE_SIZE);
+    
+    if (ret) {
+        SetPageError(page);
+        mapping_set_error(page->mapping, ret);
+    }
+    
+    end_page_writeback(page);
+    unlock_page(page);
+    
+    return ret;
+}
+
+static const struct address_space_operations old_aops = {
+    .readpage       = old_readpage,
+    .writepage      = old_writepage,
+    .set_page_dirty = __set_page_dirty_buffers,
+};
+
+/*
+ * new_driver.c - 迁移后的实现
+ */
+
+static int new_read_folio(struct file *file, struct folio *folio)
+{
+    struct inode *inode = folio->mapping->host;
+    struct my_device *dev = inode->i_sb->s_fs_info;
+    sector_t sector = folio->index << (PAGE_SHIFT - 9);
+    size_t size = folio_size(folio);
+    int ret;
+    
+    /* 注意：read_folio 被调用时 folio 已经被锁定 */
+    
+    /* 对于大 folio，需要计算正确的扇区数 */
+    sector_t num_sectors = size >> 9;
+    
+    /* 读取数据 */
+    ret = my_device_read_large(dev, sector, folio, size);
+    
+    if (ret == 0) {
+        folio_mark_uptodate(folio);
+    } else {
+        folio_clear_uptodate(folio);
+        folio_set_error(folio);
+    }
+    
+    folio_unlock(folio);
+    return ret;
+}
+
+static int new_writepages(struct address_space *mapping,
+                           struct writeback_control *wbc)
+{
+    struct inode *inode = mapping->host;
+    struct my_device *dev = inode->i_sb->s_fs_info;
+    struct folio_batch fbatch;
+    pgoff_t index = 0;
+    pgoff_t end = ULONG_MAX;
+    int ret = 0;
+    
+    folio_batch_init(&fbatch);
+    
+    if (wbc->range_cyclic) {
+        index = mapping->writeback_index;
+    } else {
+        index = wbc->range_start >> PAGE_SHIFT;
+        end = wbc->range_end >> PAGE_SHIFT;
+    }
+    
+    while (filemap_get_folios_tag(mapping, &index, end,
+                                   PAGECACHE_TAG_DIRTY, &fbatch)) {
+        unsigned int i;
+        
+        for (i = 0; i < folio_batch_count(&fbatch); i++) {
+            struct folio *folio = fbatch.folios[i];
+            
+            folio_lock(folio);
+            
+            if (!folio_test_dirty(folio)) {
+                folio_unlock(folio);
+                continue;
+            }
+            
+            folio_clear_dirty_for_io(folio);
+            folio_start_writeback(folio);
+            
+            /* 写入设备 */
+            sector_t sector = folio->index << (PAGE_SHIFT - 9);
+            ret = my_device_write_large(dev, sector, folio,
+                                        folio_size(folio));
+            
+            if (ret) {
+                folio_set_error(folio);
+                mapping_set_error(mapping, ret);
+            }
+            
+            folio_end_writeback(folio);
+            folio_unlock(folio);
+            
+            if (--wbc->nr_to_write <= 0)
+                break;
+        }
+        
+        folio_batch_release(&fbatch);
+        
+        if (wbc->nr_to_write <= 0)
+            break;
+    }
+    
+    return ret;
+}
+
+static bool new_dirty_folio(struct address_space *mapping,
+                             struct folio *folio)
+{
+    return filemap_dirty_folio(mapping, folio);
+}
+
+static bool new_release_folio(struct folio *folio, gfp_t gfp)
+{
+    /* 检查是否有私有数据需要释放 */
+    if (folio_get_private(folio)) {
+        /* 释放私有数据 */
+        /* ... */
+        folio_detach_private(folio);
+    }
+    return true;
+}
+
+static void new_invalidate_folio(struct folio *folio,
+                                  size_t offset, size_t length)
+{
+    /* 如果整个 folio 被失效 */
+    if (offset == 0 && length == folio_size(folio)) {
+        if (folio_get_private(folio)) {
+            /* 释放私有数据 */
+            folio_detach_private(folio);
+        }
+    }
+}
+
+static const struct address_space_operations new_aops = {
+    .read_folio         = new_read_folio,
+    .writepages         = new_writepages,
+    .dirty_folio        = new_dirty_folio,
+    .release_folio      = new_release_folio,
+    .invalidate_folio   = new_invalidate_folio,
+};
+\end{lstlisting}
+
+上述代码完整展示了一个简单块设备驱动从旧式 page API 迁移到 folio API 的过程。迁移前的 \texttt{old\_readpage} 函数接收 \texttt{struct page *} 参数，使用 \texttt{page->index} 计算扇区号，通过 \texttt{page\_address} 获取虚拟地址，并用 \texttt{PAGE\_SIZE} 硬编码读取大小。迁移后的 \texttt{new\_read\_folio} 改为接收 \texttt{struct folio *}，使用 \texttt{folio\_size(folio)} 获取实际大小（支持大 folio），并且不再需要手动调用 \texttt{lock\_page}，因为 \texttt{read\_folio} 回调被调用时 folio 已经被锁定。
+
+写入路径的迁移更为彻底：旧代码中的 \texttt{old\_writepage} 是逐页写入，而迁移后采用 \texttt{new\_writepages} 进行批量写入。\texttt{new\_writepages} 使用 \texttt{folio\_batch} 和 \texttt{filemap\_get\_folios\_tag} 批量获取脏 folio，然后逐个处理。每个 folio 经过加锁、检查脏标志、清除脏标志、标记回写中、执行设备写入、结束回写、解锁的完整流程。同时，\texttt{new\_dirty\_folio} 替代了 \texttt{set\_page\_dirty}，\texttt{new\_release\_folio} 和 \texttt{new\_invalidate\_folio} 分别处理 folio 释放时的私有数据清理和 folio 失效时的资源回收。最终的 \texttt{new\_aops} 结构体展示了迁移后完整的回调集合。
+
+\subsection{案例2：复杂文件系统迁移}
+
+\begin{lstlisting}[language=C,caption={复杂文件系统迁移案例（部分）},label={lst:case-fs}]
+/*
+ * 案例：一个复杂文件系统的 folio 迁移
+ * 
+ * 这个案例展示了如何处理更复杂的场景，
+ * 包括元数据页和数据页的分别处理
+ */
+
+/*
+ * 第一步：定义新的 folio 操作结构
+ */
+struct myfs_folio_ops {
+    int (*read)(struct folio *folio);
+    int (*write)(struct folio *folio, struct writeback_control *wbc);
+    void (*invalidate)(struct folio *folio, size_t offset, size_t len);
+};
+
+/*
+ * 数据 folio 操作
+ */
+static int myfs_data_read_folio(struct folio *folio)
+{
+    struct inode *inode = folio->mapping->host;
+    struct myfs_inode_info *info = MYFS_I(inode);
+    loff_t pos = folio_pos(folio);
+    size_t len = folio_size(folio);
+    int ret;
+    
+    /* 检查是否超过文件大小 */
+    if (pos >= i_size_read(inode)) {
+        folio_zero_range(folio, 0, len);
+        folio_mark_uptodate(folio);
+        folio_unlock(folio);
+        return 0;
+    }
+    
+    /* 调整读取长度 */
+    if (pos + len > i_size_read(inode))
+        len = i_size_read(inode) - pos;
+    
+    /* 读取数据块 */
+    ret = myfs_read_data_blocks(inode, folio, pos, len);
+    
+    if (ret == 0) {
+        /* 如果文件末尾不满一页，填充零 */
+        if (len < folio_size(folio)) {
+            folio_zero_range(folio, len, folio_size(folio) - len);
+        }
+        folio_mark_uptodate(folio);
+    } else {
+        folio_set_error(folio);
+    }
+    
+    folio_unlock(folio);
+    return ret;
+}
+
+/*
+ * 元数据 folio 操作
+ */
+static int myfs_meta_read_folio(struct folio *folio)
+{
+    struct super_block *sb = folio->mapping->host->i_sb;
+    struct myfs_sb_info *sbi = MYFS_SB(sb);
+    sector_t block = folio->index;
+    int ret;
+    
+    /* 元数据通常不需要大 folio */
+    if (folio_order(folio) != 0) {
+        pr_warn("Unexpected large folio for metadata\n");
+        folio_set_error(folio);
+        folio_unlock(folio);
+        return -EINVAL;
+    }
+    
+    ret = myfs_read_meta_block(sbi, block, folio);
+    
+    if (ret == 0) {
+        folio_mark_uptodate(folio);
+    } else {
+        folio_set_error(folio);
+    }
+    
+    folio_unlock(folio);
+    return ret;
+}
+
+/*
+ * 统一的 read_folio 入口
+ */
+static int myfs_read_folio(struct file *file, struct folio *folio)
+{
+    struct inode *inode = folio->mapping->host;
+    
+    if (S_ISREG(inode->i_mode)) {
+        return myfs_data_read_folio(folio);
+    } else if (MYFS_I(inode)->i_flags & MYFS_METADATA_INODE) {
+        return myfs_meta_read_folio(folio);
+    } else {
+        /* 目录或其他类型 */
+        return myfs_data_read_folio(folio);
+    }
+}
+
+/*
+ * 预读支持 - 利用大 folio 优化
+ */
+static void myfs_readahead(struct readahead_control *ractl)
+{
+    struct inode *inode = ractl->mapping->host;
+    struct myfs_sb_info *sbi = MYFS_SB(inode->i_sb);
+    
+    /* 根据文件大小和设备特性选择 folio order */
+    unsigned int order = 0;
+    
+    if (sbi->s_features & MYFS_FEATURE_LARGE_FOLIO) {
+        loff_t size = i_size_read(inode);
+        unsigned long ra_pages = readahead_count(ractl);
+        
+        /* 大文件和大预读窗口使用大 folio */
+        if (size > 1024 * 1024 && ra_pages >= 32)
+            order = 4;  /* 16 pages */
+        else if (size > 64 * 1024 && ra_pages >= 8)
+            order = 2;  /* 4 pages */
+    }
+    
+    while (readahead_count(ractl)) {
+        struct folio *folio = readahead_folio(ractl, order);
+        
+        if (!folio) {
+            if (order == 0)
+                break;
+            order--;  /* 尝试更小的 order */
+            continue;
+        }
+        
+        /* 提交读取请求 */
+        if (myfs_data_read_folio(folio) < 0) {
+            /* 读取失败，但 folio 已经被处理 */
+        }
+    }
+}
+
+/*
+ * writepages - 批量写入
+ */
+static int myfs_writepages(struct address_space *mapping,
+                            struct writeback_control *wbc)
+{
+    struct inode *inode = mapping->host;
+    struct myfs_sb_info *sbi = MYFS_SB(inode->i_sb);
+    struct myfs_writeback_ctx ctx = {
+        .inode = inode,
+        .sbi = sbi,
+    };
+    int ret;
+    
+    /* 使用 iomap 或自定义回写 */
+    if (sbi->s_features & MYFS_FEATURE_IOMAP) {
+        ret = iomap_writepages(mapping, wbc, &ctx,
+                               &myfs_writeback_ops);
+    } else {
+        ret = myfs_do_writepages(mapping, wbc, &ctx);
+    }
+    
+    return ret;
+}
+
+/*
+ * 自定义回写实现
+ */
+static int myfs_do_writepages(struct address_space *mapping,
+                               struct writeback_control *wbc,
+                               struct myfs_writeback_ctx *ctx)
+{
+    struct folio_batch fbatch;
+    pgoff_t index = wbc->range_start >> PAGE_SHIFT;
+    pgoff_t end = wbc->range_end >> PAGE_SHIFT;
+    int ret = 0;
+    int done = 0;
+    
+    folio_batch_init(&fbatch);
+    
+    while (!done && (index <= end)) {
+        int i;
+        int nr_folios = filemap_get_folios_tag(mapping, &index, end,
+                                                PAGECACHE_TAG_DIRTY,
+                                                &fbatch);
+        
+        if (!nr_folios)
+            break;
+        
+        for (i = 0; i < nr_folios; i++) {
+            struct folio *folio = fbatch.folios[i];
+            
+            folio_lock(folio);
+            
+            /* 再次检查状态 */
+            if (folio->mapping != mapping ||
+                !folio_test_dirty(folio)) {
+                folio_unlock(folio);
+                continue;
+            }
+            
+            /* 写入 */
+            ret = myfs_write_folio(folio, wbc, ctx);
+            
+            if (ret < 0) {
+                folio_unlock(folio);
+                done = 1;
+                break;
+            }
+            
+            if (--wbc->nr_to_write <= 0) {
+                done = 1;
+                break;
+            }
+        }
+        
+        folio_batch_release(&fbatch);
+        cond_resched();
+    }
+    
+    return ret;
+}
+
+/*
+ * 迁移支持
+ */
+static int myfs_migrate_folio(struct address_space *mapping,
+                               struct folio *dst, struct folio *src,
+                               enum migrate_mode mode)
+{
+    /* 检查是否可以迁移 */
+    if (folio_get_private(src)) {
+        /* 有私有数据，需要特殊处理 */
+        void *private = folio_get_private(src);
+        
+        /* 移动私有数据 */
+        folio_attach_private(dst, private);
+        folio_detach_private(src);
+    }
+    
+    return migrate_folio(mapping, dst, src, mode);
+}
+
+/*
+ * 完整的 address_space_operations
+ */
+const struct address_space_operations myfs_aops = {
+    .read_folio         = myfs_read_folio,
+    .readahead          = myfs_readahead,
+    .writepages         = myfs_writepages,
+    .dirty_folio        = filemap_dirty_folio,
+    .release_folio      = myfs_release_folio,
+    .invalidate_folio   = myfs_invalidate_folio,
+    .migrate_folio      = myfs_migrate_folio,
+    .is_partially_uptodate = iomap_is_partially_uptodate,
+};
+\end{lstlisting}
+
+上述代码展示了一个复杂文件系统从 page 迁移到 folio 的完整过程。首先，代码定义了 \texttt{myfs\_folio\_ops} 结构体，将读取、写入和失效操作封装在一起，使不同类型的 folio（数据 folio 和元数据 folio）可以使用不同的处理逻辑。\texttt{myfs\_data\_read\_folio} 函数处理数据页的读取，它通过 \texttt{folio\_pos} 获取文件偏移、用 \texttt{folio\_size} 获取 folio 实际大小，并在文件末尾不足整个 folio 时调用 \texttt{folio\_zero\_range} 进行零填充。\texttt{myfs\_meta\_read\_folio} 则处理元数据页，由于元数据通常不需要大 folio，它会检查 \texttt{folio\_order} 并拒绝非零 order 的请求。
+
+统一入口函数 \texttt{myfs\_read\_folio} 根据 inode 类型（普通文件、元数据 inode、目录等）分派到不同的读取函数。\texttt{myfs\_readahead} 实现了预读支持，它根据文件系统特性标志 \texttt{MYFS\_FEATURE\_LARGE\_FOLIO}、文件大小和预读窗口大小动态选择 folio order，对于大文件和大预读窗口使用 order-4（16 页）的 folio，从而减少元数据开销和 TLB 压力。如果分配大 folio 失败，则通过 \texttt{order--} 逐步降级到更小的 order。
+
+\texttt{myfs\_do\_writepages} 实现了批量回写逻辑，使用 \texttt{filemap\_get\_folios\_tag} 获取带有 \texttt{PAGECACHE\_TAG\_DIRTY} 标签的脏 folio，逐个加锁、检查状态后写入。特别值得注意的是，在加锁后需要重新检查 \texttt{folio->mapping} 和脏标志，因为在获取锁之前 folio 的状态可能已经被其他线程改变。\texttt{myfs\_migrate\_folio} 处理 folio 迁移（用于内存热插拔和 NUMA 平衡），它需要将源 folio 的私有数据转移到目标 folio。最终的 \texttt{myfs\_aops} 结构体展示了一个完整的现代化 \texttt{address\_space\_operations}，包含了读取、预读、回写、脏页标记、释放、失效和迁移等所有必要的回调。
+
+\section{最佳实践总结}
+
+\subsection{代码规范}
+
+\begin{table}[htbp]
+\centering
+\caption{folio 代码规范}
+\label{tab:coding-standards}
+\begin{tabularx}{\textwidth}{|l|X|}
+\hline
+\textbf{规范} & \textbf{说明} \\
+\hline
+\multicolumn{2}{|c|}{\textbf{命名规范}} \\
+\hline
+变量命名 & 使用 \texttt{folio} 作为变量名，而非 \texttt{page} 或 \texttt{f} \\
+\hline
+函数命名 & 新函数以 \texttt{folio\_} 或 \texttt{\_folio} 结尾表示使用 folio \\
+\hline
+\multicolumn{2}{|c|}{\textbf{文档规范}} \\
+\hline
+函数注释 & 明确说明参数是否需要锁定、引用计数变化 \\
+\hline
+返回值说明 & 说明返回的 folio 是否已增加引用计数 \\
+\hline
+\multicolumn{2}{|c|}{\textbf{错误处理}} \\
+\hline
+空值检查 & 始终检查 API 返回的 folio 是否为 NULL \\
+\hline
+错误路径 & 确保错误路径正确释放资源 \\
+\hline
+\multicolumn{2}{|c|}{\textbf{性能}} \\
+\hline
+批量操作 & 优先使用 \texttt{folio\_batch} 进行批量处理 \\
+\hline
+减少转换 & 尽量保持 folio 类型，避免不必要的 page 转换 \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsection{检查清单}
+
+\begin{checklistbox}{folio 迁移检查清单}
+\begin{enumerate}
+    \item[$\square$] \textbf{代码审查}
+    \begin{itemize}
+        \item[$\square$] 所有 page API 都转换为 folio API
+        \item[$\square$] 引用计数操作配对正确
+        \item[$\square$] 锁操作配对正确
+        \item[$\square$] 没有硬编码 PAGE\_SIZE
+    \end{itemize}
+    
+    \item[$\square$] \textbf{编译检查}
+    \begin{itemize}
+        \item[$\square$] 无编译警告
+        \item[$\square$] 无稀疏检查警告
+        \item[$\square$] 静态分析通过
+    \end{itemize}
+    
+    \item[$\square$] \textbf{功能测试}
+    \begin{itemize}
+        \item[$\square$] 基本读写操作正常
+        \item[$\square$] 大文件操作正常
+        \item[$\square$] 并发访问正常
+        \item[$\square$] 内存压力下行为正常
+    \end{itemize}
+    
+    \item[$\square$] \textbf{性能测试}
+    \begin{itemize}
+        \item[$\square$] 吞吐量未下降
+        \item[$\square$] 延迟未增加
+        \item[$\square$] 内存使用合理
+    \end{itemize}
+    
+    \item[$\square$] \textbf{文档更新}
+    \begin{itemize}
+        \item[$\square$] 更新 API 文档
+        \item[$\square$] 更新示例代码
+        \item[$\square$] 记录迁移说明
+    \end{itemize}
+\end{enumerate}
+\end{checklistbox}
+
+\section{未来展望和建议}
+
+\subsection{即将到来的变化}
+
+基于社区讨论，以下是可能在未来版本中出现的变化：
+
+\begin{enumerate}
+    \item \textbf{page API 的完全废弃}：部分 page API 可能在未来版本中被移除
+    
+    \item \textbf{默认大 folio}：文件系统可能默认使用大 folio
+    
+    \item \textbf{动态 folio 大小}：运行时调整 folio 大小的能力
+    
+    \item \textbf{folio 内存分配器}：专门针对 folio 优化的分配器
+\end{enumerate}
+
+\subsection{建议}
+
+\begin{enumerate}
+    \item \textbf{新代码}：所有新代码都应该使用 folio API
+    
+    \item \textbf{渐进迁移}：维护旧代码时，可以逐步迁移到 folio
+    
+    \item \textbf{测试覆盖}：为 folio 相关代码编写充分的测试
+    
+    \item \textbf{关注社区}：跟踪 linux-mm 邮件列表的最新讨论
+    
+    \item \textbf{性能监控}：在迁移后持续监控性能变化
+\end{enumerate}
+
+\section{本章小结}
+
+本章提供了从 page 到 folio 迁移的完整指南。关键要点包括：
+
+\begin{enumerate}
+    \item 理解何时使用 folio，何时仍可使用 page
+    \item 掌握常见的迁移模式和技巧
+    \item 使用自动化工具加速迁移
+    \item 避免常见的错误和陷阱
+    \item 正确调试和测试 folio 代码
+    \item 通过实际案例学习最佳实践
+\end{enumerate}
+
+\begin{keypoints}{本章要点}
+\begin{itemize}
+    \item 页缓存相关代码必须使用 folio，低层分配和页表操作可继续使用 page
+    \item 迁移时注意引用计数、锁操作和大小计算的变化
+    \item 使用 Coccinelle 等工具进行自动化迁移
+    \item 避免混用 page/folio 引用计数、假设 PAGE\_SIZE、忽略多索引覆盖
+    \item 通过单元测试、集成测试和压力测试验证迁移正确性
+    \item 利用大 folio 和批量操作优化性能
+\end{itemize}
+\end{keypoints}
+
+\begin{furtherreading}{扩展阅读}
+\begin{itemize}
+    \item Documentation/mm/folio.rst - 内核官方文档
+    \item Documentation/filesystems/vfs.rst - VFS 文档
+    \item scripts/coccinelle/ - 内核中的 Coccinelle 脚本
+    \item tools/testing/kunit/ - KUnit 测试框架文档
+\end{itemize}
+\end{furtherreading}
+
+
+
+\end{document}
