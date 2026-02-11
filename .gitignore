@@ -1,0 +1,33 @@
+# 过滤编译产生的中间文件
+*.aux
+*.log
+*.out
+*.toc
+*.pdf
+*.gz
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.idx
+*.ind
+*.ilg
+*.lof
+*.lot
+
+# 构建目录
+build/
+
+# 生成的 PDF 文件
+*.pdf
+
+# macOS 文件
+.DS_Store
+._*
+
+# 编辑器临时文件
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

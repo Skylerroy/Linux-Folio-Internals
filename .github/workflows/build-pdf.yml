@@ -35,16 +35,56 @@ jobs:
     - name: Set execute permission for build script
       run: chmod +x build.sh
 
+    - name: Verify project structure
+      run: |
+        echo "=== Project structure ==="
+        ls -la
+        echo ""
+        echo "=== Chapters directory ==="
+        ls -la chapters/
+        echo ""
+        echo "=== Appendix directory ==="
+        ls -la appendix/
+        echo ""
+        echo "=== Main TeX file ==="
+        head -20 main.tex
+
     - name: Build PDF
-      run: ./build.sh
+      run: |
+        echo "Starting PDF build..."
+        ./build.sh 2>&1 | tee build_output.log
+        BUILD_STATUS=${PIPESTATUS[0]}
+        echo "Build exit status: $BUILD_STATUS"
+        exit $BUILD_STATUS
+
+    - name: Check build results
+      if: always()
+      run: |
+        echo "=== Checking build directory ==="
+        ls -lah build/ || echo "Build directory not found"
+        echo ""
+        echo "=== Looking for PDF files ==="
+        find . -name "*.pdf" -type f -exec ls -lh {} \;
+        echo ""
+        echo "=== Root directory contents ==="
+        ls -lah
+        echo ""
+        echo "=== Last 50 lines of build log ==="
+        if [ -f "build/main.log" ]; then
+          tail -50 build/main.log
+        else
+          echo "Build log not found"
+        fi
 
     - name: Check PDF file
       run: |
         if [ -f "深入理解Linux_Folio.pdf" ]; then
-          echo "PDF generated successfully"
+          echo "✓ PDF generated successfully"
           ls -lh 深入理解Linux_Folio.pdf
+          echo "PDF size: $(du -h 深入理解Linux_Folio.pdf | cut -f1)"
         else
-          echo "Error: PDF file not found"
+          echo "✗ Error: PDF file not found"
+          echo "Build may have failed. Check the logs above."
           exit 1
         fi
 
@@ -55,15 +95,18 @@ jobs:
         path: 深入理解Linux_Folio.pdf
         retention-days: 30
 
-    # 保存构建目录以便调试
+    # 保存所有构建日志和临时文件以便调试
     - name: Upload build logs
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: build-logs-${{ github.sha }}
-        path: build/*.log
+        path: |
+          build_output.log
+          build/
+          *.log
         retention-days: 7
-        if-no-files-found: ignore
+        if-no-files-found: warn
 
   # 自动发布 Release（仅在打 tag 时）
   release:

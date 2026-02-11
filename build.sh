@@ -35,19 +35,32 @@ cd build
 
 # 第一次编译（生成aux文件）
 echo "第一次编译..."
-lualatex -interaction=nonstopmode main.tex
+lualatex -interaction=nonstopmode main.tex || {
+    echo "警告: 第一次编译出现错误，但继续执行..."
+    echo "查看 build/main.log 了解详细信息"
+}
 
-# 生成索引
-echo "生成索引..."
-makeindex main.idx
+# 生成索引（如果 idx 文件存在）
+if [ -f "main.idx" ]; then
+    echo "生成索引..."
+    makeindex main.idx || {
+        echo "警告: 索引生成失败，但继续执行..."
+    }
+else
+    echo "跳过索引生成（main.idx 不存在）"
+fi
 
 # 第二次编译（包含索引和目录）
 echo "第二次编译..."
-lualatex -interaction=nonstopmode main.tex
+lualatex -interaction=nonstopmode main.tex || {
+    echo "警告: 第二次编译出现错误，但继续执行..."
+}
 
 # 第三次编译（最终版本，确保目录完整）
 echo "第三次编译..."
-lualatex -interaction=nonstopmode main.tex
+lualatex -interaction=nonstopmode main.tex || {
+    echo "警告: 第三次编译出现错误"
+}
 
 # 检查是否成功生成PDF
 if [ -f "main.pdf" ]; then
@@ -63,8 +76,9 @@ else
     exit 1
 fi
 
-# 清理临时文件
+# 清理临时文件（保留 log 文件以便调试）
 echo "清理临时文件..."
-rm -f *.aux *.log *.toc *.lof *.lot *.idx *.ind *.ilg *.out
+rm -f *.aux *.toc *.lof *.lot *.idx *.ind *.ilg *.out
 
 echo "编译完成！"
+echo "日志文件保存在: build/*.log"
